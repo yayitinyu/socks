@@ -4,7 +4,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 export LC_ALL=C
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.0.1"
 APP_NAME="socks5-node"
 CONFIG_DIR="/etc/${APP_NAME}"
 STATE_FILE="${CONFIG_DIR}/state.env"
@@ -352,6 +352,26 @@ port_in_use() {
         }
         END { exit found ? 0 : 1 }
     ' /proc/net/tcp /proc/net/tcp6 2>/dev/null
+}
+
+# Dante may still be spawning workers when systemctl reports active.
+# Wait until the TCP listen socket is visible before running probes.
+wait_for_port_listen() {
+    local port=$1
+    local timeout_seconds=${2:-15}
+    local deadline
+
+    deadline=$(($(date +%s) + timeout_seconds))
+    while (( $(date +%s) <= deadline )); do
+        if port_in_use "$port"; then
+            return 0
+        fi
+        if ! systemctl is-active --quiet "${APP_NAME}.service"; then
+            return 1
+        fi
+        sleep 0.1
+    done
+    return 1
 }
 
 choose_random_port() {
@@ -1372,6 +1392,10 @@ ensure_existing_install_running() {
     systemctl restart "${APP_NAME}-firewall.service"
     systemctl restart "${APP_NAME}.service"
     systemctl is-active --quiet "${APP_NAME}.service" || die "恢复后 SOCKS5 服务仍未运行。"
+    if ! wait_for_port_listen "$SOCKS_PORT" 15; then
+        journalctl -u "${APP_NAME}.service" -n 30 --no-pager >&2 || true
+        die "恢复后服务在运行，但端口 ${SOCKS_PORT} 没有监听。"
+    fi
     verify_socks5_authentication
     smoke_test_proxy
     atomic_write "$STATE_FILE" 600 render_state
@@ -1403,8 +1427,6 @@ preflight_new_install() {
 }
 
 install_action() {
-    local listen_output
-
     if [[ -f "$STATE_FILE" ]]; then
         ((CONFIG_OVERRIDES == 0)) || die "节点已安装。为避免误删账号或旧防火墙规则，请先卸载后再用新参数安装。"
         load_state
@@ -1490,15 +1512,7 @@ install_action() {
         die "SOCKS5 服务启动失败。"
     }
 
-    listen_output=$(ss -H -ltn 2>/dev/null || true)
-    if ! awk -v expected="$SOCKS_PORT" '
-        {
-            address = $4
-            sub(/^.*:/, "", address)
-            if (address == expected) found = 1
-        }
-        END { exit found ? 0 : 1 }
-    ' <<<"$listen_output"; then
+    if ! wait_for_port_listen "$SOCKS_PORT" 15; then
         journalctl -u "${APP_NAME}.service" -n 30 --no-pager >&2 || true
         die "服务已启动，但端口 ${SOCKS_PORT} 没有监听。"
     fi
