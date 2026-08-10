@@ -1,0 +1,454 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+TEST_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+PROJECT_DIR=$(cd -- "${TEST_DIR}/.." && pwd)
+SCRIPT_PATH="${PROJECT_DIR}/socks5.sh"
+TEMP_CONFIG=""
+TEMP_CONFIG_PRIVATE=""
+TEMP_HELPER=""
+TEMP_UFW_HELPER=""
+TEMP_FIREWALLD_HELPER=""
+TEMP_IPTABLES_HELPER=""
+TEMP_SERVICE=""
+TEMP_STATE=""
+FIREWALL_SANDBOX=""
+
+cleanup() {
+    [[ -z "$TEMP_CONFIG" || ! -f "$TEMP_CONFIG" ]] || rm -f -- "$TEMP_CONFIG"
+    [[ -z "$TEMP_CONFIG_PRIVATE" || ! -f "$TEMP_CONFIG_PRIVATE" ]] || rm -f -- "$TEMP_CONFIG_PRIVATE"
+    [[ -z "$TEMP_HELPER" || ! -f "$TEMP_HELPER" ]] || rm -f -- "$TEMP_HELPER"
+    [[ -z "$TEMP_UFW_HELPER" || ! -f "$TEMP_UFW_HELPER" ]] || rm -f -- "$TEMP_UFW_HELPER"
+    [[ -z "$TEMP_FIREWALLD_HELPER" || ! -f "$TEMP_FIREWALLD_HELPER" ]] || rm -f -- "$TEMP_FIREWALLD_HELPER"
+    [[ -z "$TEMP_IPTABLES_HELPER" || ! -f "$TEMP_IPTABLES_HELPER" ]] || rm -f -- "$TEMP_IPTABLES_HELPER"
+    [[ -z "$TEMP_SERVICE" || ! -f "$TEMP_SERVICE" ]] || rm -f -- "$TEMP_SERVICE"
+    [[ -z "$TEMP_STATE" || ! -f "$TEMP_STATE" ]] || rm -f -- "$TEMP_STATE"
+    if [[ -n "$FIREWALL_SANDBOX" && -d "$FIREWALL_SANDBOX" ]]; then
+        rm -f -- \
+            "$FIREWALL_SANDBOX/bin/ufw" \
+            "$FIREWALL_SANDBOX/bin/nft" \
+            "$FIREWALL_SANDBOX/bin/firewall-cmd" \
+            "$FIREWALL_SANDBOX/bin/iptables" \
+            "$FIREWALL_SANDBOX/bin/semanage" \
+            "$FIREWALL_SANDBOX/ufw.state" \
+            "$FIREWALL_SANDBOX/nft.state" \
+            "$FIREWALL_SANDBOX/firewalld-permanent.state" \
+            "$FIREWALL_SANDBOX/firewalld-runtime.state" \
+            "$FIREWALL_SANDBOX/iptables.state" \
+            "$FIREWALL_SANDBOX/selinux.state"
+        rmdir -- "$FIREWALL_SANDBOX/bin" "$FIREWALL_SANDBOX"
+    fi
+}
+trap cleanup EXIT
+
+export SOCKS5_NODE_LIB_ONLY=1
+# shellcheck disable=SC1090
+source "$SCRIPT_PATH"
+
+TESTS_RUN=0
+
+pass() {
+    TESTS_RUN=$((TESTS_RUN + 1))
+    printf 'ok %d - %s\n' "$TESTS_RUN" "$1"
+}
+
+fail() {
+    printf 'not ok %d - %s\n' "$((TESTS_RUN + 1))" "$1" >&2
+    exit 1
+}
+
+assert_true() {
+    local description=$1
+    shift
+    if "$@"; then
+        pass "$description"
+    else
+        fail "$description"
+    fi
+}
+
+assert_false() {
+    local description=$1
+    shift
+    if "$@"; then
+        fail "$description"
+    else
+        pass "$description"
+    fi
+}
+
+assert_contains() {
+    local description=$1
+    local file=$2
+    local expected=$3
+
+    if grep -Fq -- "$expected" "$file"; then
+        pass "$description"
+    else
+        printf 'Missing text: %s\n' "$expected" >&2
+        fail "$description"
+    fi
+}
+
+assert_not_contains() {
+    local description=$1
+    local file=$2
+    local unexpected=$3
+
+    if grep -Fq -- "$unexpected" "$file"; then
+        printf 'Unexpected text: %s\n' "$unexpected" >&2
+        fail "$description"
+    else
+        pass "$description"
+    fi
+}
+
+assert_file_exists() {
+    local description=$1
+    local file=$2
+
+    if [[ -f "$file" ]]; then
+        pass "$description"
+    else
+        fail "$description"
+    fi
+}
+
+assert_file_absent() {
+    local description=$1
+    local file=$2
+
+    if [[ -e "$file" ]]; then
+        fail "$description"
+    else
+        pass "$description"
+    fi
+}
+
+assert_true "accepts the lowest custom unprivileged port" is_valid_port 1025
+assert_true "accepts port 65535" is_valid_port 65535
+assert_false "rejects a privileged port" is_valid_port 1024
+assert_false "rejects a port above 65535" is_valid_port 65536
+assert_false "rejects a non-numeric port" is_valid_port 20x00
+assert_false "rejects an overflowing numeric port" is_valid_port 18446744073709552640
+
+assert_true "accepts generated-style usernames" is_valid_username s5u_deadbeef
+assert_true "accepts a conventional username" is_valid_username proxy-user
+assert_false "rejects an uppercase Linux username" is_valid_username ProxyUser
+assert_false "rejects shell metacharacters in usernames" is_valid_username 'proxy;root'
+
+assert_true "accepts a safe 12-character password" is_valid_password Abcdef1234._
+assert_false "rejects a short password" is_valid_password short123
+assert_false "rejects colon in passwords" is_valid_password 'Abcdef123456:'
+assert_false "rejects shell metacharacters in passwords" is_valid_password 'Abcdef123456$'
+
+assert_true "accepts an IPv4 host CIDR" is_valid_ipv4_cidr 203.0.113.8/32
+assert_true "accepts the all-IPv4 CIDR" is_valid_ipv4_cidr 0.0.0.0/0
+assert_false "rejects an IPv4 octet above 255" is_valid_ipv4_cidr 256.0.0.1/32
+assert_false "rejects ambiguous leading zeroes" is_valid_ipv4_cidr 010.0.0.1/32
+assert_false "rejects an oversized prefix" is_valid_ipv4_cidr 192.0.2.1/33
+
+if [[ "$(normalize_ipv4_cidr 203.0.113.9)" == "203.0.113.9/32" ]]; then
+    pass "normalizes a single IPv4 address to /32"
+else
+    fail "normalizes a single IPv4 address to /32"
+fi
+
+for _ in {1..32}; do
+    generated_port=$(choose_random_port) || fail "generates a random high port"
+    if ((generated_port < 20000 || generated_port > 60000)); then
+        fail "keeps random ports in the documented range"
+    fi
+done
+pass "keeps random ports in the documented range"
+
+export SOCKS_PORT=45678
+export EXTERNAL_INTERFACE=eth0
+export DAEMON_USER=s5d_deadbeef
+export AUTH_GROUP=s5g_deadbeef
+export ALLOW_CIDR=203.0.113.8/32
+export ALLOW_PRIVATE=0
+TEMP_CONFIG=$(mktemp)
+render_dante_config >"$TEMP_CONFIG"
+
+assert_contains "binds the selected high port" "$TEMP_CONFIG" "internal: 0.0.0.0 port = 45678"
+assert_contains "uses the detected egress interface" "$TEMP_CONFIG" "external: eth0"
+assert_contains "drops privileges with the Dante 1.4.x directive" "$TEMP_CONFIG" "user.unprivileged: s5d_deadbeef"
+assert_not_contains "does not emit the obsolete privilege directive" "$TEMP_CONFIG" "user.notprivileged:"
+assert_contains "requires username authentication" "$TEMP_CONFIG" "socksmethod: username"
+assert_contains "limits authenticated access to the managed group" "$TEMP_CONFIG" "group: s5g_deadbeef"
+assert_contains "limits client source addresses" "$TEMP_CONFIG" "from: 203.0.113.8/32 to: 0.0.0.0/0"
+assert_contains "blocks cloud metadata and link-local targets" "$TEMP_CONFIG" "to: 169.254.0.0/16"
+assert_contains "allows TCP CONNECT" "$TEMP_CONFIG" "command: connect"
+assert_not_contains "does not enable UDP Associate" "$TEMP_CONFIG" "udpassociate"
+
+export ALLOW_PRIVATE=1
+TEMP_CONFIG_PRIVATE=$(mktemp)
+render_dante_config >"$TEMP_CONFIG_PRIVATE"
+assert_not_contains "allow-private removes private destination blocks" "$TEMP_CONFIG_PRIVATE" "socks block {"
+
+export DANTE_BIN=/usr/sbin/danted
+TEMP_SERVICE=$(mktemp)
+render_service_unit >"$TEMP_SERVICE"
+assert_contains "service uses a unique Dante PID file" "$TEMP_SERVICE" "-p /run/socks5-node/danted.pid"
+assert_contains "service creates a private runtime directory" "$TEMP_SERVICE" "RuntimeDirectory=socks5-node"
+assert_not_contains "service does not force a restrictive Dante umask" "$TEMP_SERVICE" "UMask="
+assert_contains "service reads the SELinux-compatible config path" "$TEMP_SERVICE" "/etc/socks/socks5-node.conf"
+
+export FIREWALL_BACKEND=nftables
+export FIREWALL_ZONE=""
+TEMP_HELPER=$(mktemp)
+render_firewall_helper >"$TEMP_HELPER"
+assert_true "generated firewall helper has valid Bash syntax" bash -n "$TEMP_HELPER"
+assert_contains "firewall helper carries the selected port" "$TEMP_HELPER" "PORT=45678"
+assert_contains "firewall helper carries the source CIDR" "$TEMP_HELPER" "ALLOW_CIDR=203.0.113.8/32"
+assert_contains "nftables rule has an ownership comment" "$TEMP_HELPER" "comment \"\$COMMENT\""
+assert_contains "iptables rule has an ownership comment" "$TEMP_HELPER" "--comment \"\$COMMENT\""
+
+FIREWALL_SANDBOX=$(mktemp -d)
+mkdir -p "$FIREWALL_SANDBOX/bin"
+
+cat >"$FIREWALL_SANDBOX/bin/ufw" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+case "${1:-}" in
+    status)
+        if [[ "${FAKE_UFW_INACTIVE:-0}" == "1" ]]; then
+            printf 'Status: inactive\n'
+        else
+            printf 'Status: active\n'
+        fi
+        if [[ -f "$FAKE_UFW_STATE" && "${FAKE_UFW_INACTIVE:-0}" != "1" ]]; then
+            if [[ "${2:-}" == "numbered" ]]; then
+                printf '[ 1] 45678/tcp ALLOW IN 203.0.113.8/32 # socks5-node-45678\n'
+            else
+                printf '45678/tcp ALLOW IN 203.0.113.8/32 # socks5-node-45678\n'
+            fi
+        fi
+        ;;
+    show)
+        [[ "${2:-}" == "added" ]]
+        if [[ -f "$FAKE_UFW_STATE" ]]; then
+            printf "ufw allow from 203.0.113.8/32 to any port 45678 proto tcp comment 'socks5-node-45678'\n"
+        fi
+        ;;
+    allow)
+        : >"$FAKE_UFW_STATE"
+        ;;
+    --force)
+        [[ "${2:-}" == "delete" && ("${3:-}" == "1" || "${3:-}" == "allow") ]]
+        rm -f -- "$FAKE_UFW_STATE"
+        ;;
+    *)
+        exit 2
+        ;;
+esac
+EOF
+chmod 700 "$FIREWALL_SANDBOX/bin/ufw"
+
+export FIREWALL_BACKEND=ufw
+TEMP_UFW_HELPER=$(mktemp)
+render_firewall_helper >"$TEMP_UFW_HELPER"
+chmod 700 "$TEMP_UFW_HELPER"
+FAKE_UFW_STATE="$FIREWALL_SANDBOX/ufw.state" \
+    PATH="$FIREWALL_SANDBOX/bin:$PATH" "$TEMP_UFW_HELPER" add
+assert_file_exists "UFW add creates the owned rule" "$FIREWALL_SANDBOX/ufw.state"
+FAKE_UFW_STATE="$FIREWALL_SANDBOX/ufw.state" \
+    PATH="$FIREWALL_SANDBOX/bin:$PATH" "$TEMP_UFW_HELPER" remove
+assert_file_absent "UFW remove deletes the owned rule by comment" "$FIREWALL_SANDBOX/ufw.state"
+: >"$FIREWALL_SANDBOX/ufw.state"
+FAKE_UFW_INACTIVE=1 FAKE_UFW_STATE="$FIREWALL_SANDBOX/ufw.state" \
+    PATH="$FIREWALL_SANDBOX/bin:$PATH" "$TEMP_UFW_HELPER" remove
+assert_file_absent "UFW remove also clears a persistent rule while inactive" "$FIREWALL_SANDBOX/ufw.state"
+
+cat >"$FIREWALL_SANDBOX/bin/firewall-cmd" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+if [[ "${1:-}" == "--state" ]]; then
+    exit 0
+fi
+
+state_file=$FAKE_FIREWALLD_RUNTIME_STATE
+action=""
+for argument in "$@"; do
+    case "$argument" in
+        --permanent) state_file=$FAKE_FIREWALLD_PERMANENT_STATE ;;
+        --query-rich-rule=*) action=query ;;
+        --add-rich-rule=*) action=add ;;
+        --remove-rich-rule=*) action=remove ;;
+    esac
+done
+
+case "$action" in
+    query) [[ -f "$state_file" ]] ;;
+    add) : >"$state_file" ;;
+    remove) rm -f -- "$state_file" ;;
+    *) exit 2 ;;
+esac
+EOF
+chmod 700 "$FIREWALL_SANDBOX/bin/firewall-cmd"
+
+export FIREWALL_BACKEND=firewalld
+export FIREWALL_ZONE=public
+TEMP_FIREWALLD_HELPER=$(mktemp)
+render_firewall_helper >"$TEMP_FIREWALLD_HELPER"
+chmod 700 "$TEMP_FIREWALLD_HELPER"
+FAKE_FIREWALLD_PERMANENT_STATE="$FIREWALL_SANDBOX/firewalld-permanent.state" \
+    FAKE_FIREWALLD_RUNTIME_STATE="$FIREWALL_SANDBOX/firewalld-runtime.state" \
+    PATH="$FIREWALL_SANDBOX/bin:$PATH" "$TEMP_FIREWALLD_HELPER" add
+assert_file_exists "firewalld add creates a persistent rich rule" "$FIREWALL_SANDBOX/firewalld-permanent.state"
+assert_file_exists "firewalld add creates a runtime rich rule" "$FIREWALL_SANDBOX/firewalld-runtime.state"
+FAKE_FIREWALLD_PERMANENT_STATE="$FIREWALL_SANDBOX/firewalld-permanent.state" \
+    FAKE_FIREWALLD_RUNTIME_STATE="$FIREWALL_SANDBOX/firewalld-runtime.state" \
+    PATH="$FIREWALL_SANDBOX/bin:$PATH" "$TEMP_FIREWALLD_HELPER" remove
+assert_file_absent "firewalld remove clears the persistent rich rule" "$FIREWALL_SANDBOX/firewalld-permanent.state"
+assert_file_absent "firewalld remove clears the runtime rich rule" "$FIREWALL_SANDBOX/firewalld-runtime.state"
+
+cat >"$FIREWALL_SANDBOX/bin/iptables" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+case "${3:-}" in
+    -S) exit 0 ;;
+    -C) [[ -f "$FAKE_IPTABLES_STATE" ]] ;;
+    -I) : >"$FAKE_IPTABLES_STATE" ;;
+    -D) rm -f -- "$FAKE_IPTABLES_STATE" ;;
+    *) exit 2 ;;
+esac
+EOF
+chmod 700 "$FIREWALL_SANDBOX/bin/iptables"
+
+export FIREWALL_BACKEND=iptables
+export FIREWALL_ZONE=""
+TEMP_IPTABLES_HELPER=$(mktemp)
+render_firewall_helper >"$TEMP_IPTABLES_HELPER"
+chmod 700 "$TEMP_IPTABLES_HELPER"
+FAKE_IPTABLES_STATE="$FIREWALL_SANDBOX/iptables.state" \
+    PATH="$FIREWALL_SANDBOX/bin:$PATH" "$TEMP_IPTABLES_HELPER" add
+assert_file_exists "iptables add creates the owned rule" "$FIREWALL_SANDBOX/iptables.state"
+FAKE_IPTABLES_STATE="$FIREWALL_SANDBOX/iptables.state" \
+    PATH="$FIREWALL_SANDBOX/bin:$PATH" "$TEMP_IPTABLES_HELPER" remove
+assert_file_absent "iptables remove clears the owned rule" "$FIREWALL_SANDBOX/iptables.state"
+
+cat >"$FIREWALL_SANDBOX/bin/nft" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+if [[ "$*" == "-a list ruleset" ]]; then
+    cat <<RULESET
+table inet filter {
+    chain input {
+        type filter hook input priority filter; policy drop;
+    }
+}
+RULESET
+elif [[ "${1:-} ${2:-} ${3:-}" == "-a list chain" ]]; then
+    printf 'table inet filter {\n    chain input {\n'
+    if [[ -f "$FAKE_NFT_STATE" ]]; then
+        printf '        ip saddr 203.0.113.8/32 tcp dport 45678 counter accept comment "socks5-node-45678" # handle 7\n'
+    fi
+    printf '    }\n}\n'
+elif [[ "${1:-}" == "insert" ]]; then
+    : >"$FAKE_NFT_STATE"
+elif [[ "${1:-} ${2:-}" == "delete rule" ]]; then
+    [[ "$*" == *" handle 7" ]]
+    rm -f -- "$FAKE_NFT_STATE"
+else
+    exit 2
+fi
+EOF
+chmod 700 "$FIREWALL_SANDBOX/bin/nft"
+
+export FIREWALL_BACKEND=nftables
+FAKE_NFT_STATE="$FIREWALL_SANDBOX/nft.state" \
+    PATH="$FIREWALL_SANDBOX/bin:$PATH" "$TEMP_HELPER" add
+assert_file_exists "nftables add creates the owned rule" "$FIREWALL_SANDBOX/nft.state"
+FAKE_NFT_STATE="$FIREWALL_SANDBOX/nft.state" \
+    PATH="$FIREWALL_SANDBOX/bin:$PATH" "$TEMP_HELPER" remove
+assert_file_absent "nftables remove deletes the owned rule by handle" "$FIREWALL_SANDBOX/nft.state"
+
+cat >"$FIREWALL_SANDBOX/bin/semanage" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+if [[ "$*" == "port -l" ]]; then
+    printf 'SELinux Port Type              Proto    Port Number\n'
+    printf 'ephemeral_port_t               tcp      32768-60999\n'
+    printf 'socks_port_t                   tcp      1080\n'
+elif [[ "$*" == "port -l -C" ]]; then
+    printf 'SELinux Port Type              Proto    Port Number\n'
+    if [[ -f "$FAKE_SELINUX_STATE" ]]; then
+        printf 'socks_port_t                   tcp      45678\n'
+    fi
+elif [[ "${1:-} ${2:-}" == "port -a" || "${1:-} ${2:-}" == "port -m" ]]; then
+    : >"$FAKE_SELINUX_STATE"
+elif [[ "${1:-} ${2:-}" == "port -d" ]]; then
+    rm -f -- "$FAKE_SELINUX_STATE"
+else
+    exit 2
+fi
+EOF
+chmod 700 "$FIREWALL_SANDBOX/bin/semanage"
+
+if [[ "$(FAKE_SELINUX_STATE="$FIREWALL_SANDBOX/selinux.state" \
+    PATH="$FIREWALL_SANDBOX/bin:$PATH" selinux_port_type_for 45678 0)" == "ephemeral_port_t" ]]; then
+    pass "SELinux parser resolves a port inside a policy range"
+else
+    fail "SELinux parser resolves a port inside a policy range"
+fi
+
+port_in_use() { return 1; }
+export SELINUX_ENABLED=1
+export SELINUX_PORT_MANAGED=0
+export SOCKS_PORT=45678
+export CLI_PORT=""
+FAKE_SELINUX_STATE="$FIREWALL_SANDBOX/selinux.state" \
+    PATH="$FIREWALL_SANDBOX/bin:$PATH" configure_selinux_port 1 0
+assert_file_exists "SELinux setup creates a socks_port_t override" "$FIREWALL_SANDBOX/selinux.state"
+if ((SELINUX_PORT_MANAGED == 1)); then
+    pass "SELinux setup records ownership of its override"
+else
+    fail "SELinux setup records ownership of its override"
+fi
+FAKE_SELINUX_STATE="$FIREWALL_SANDBOX/selinux.state" \
+    PATH="$FIREWALL_SANDBOX/bin:$PATH" remove_selinux_port_mapping
+assert_file_absent "SELinux cleanup removes only the managed override" "$FIREWALL_SANDBOX/selinux.state"
+
+TEMP_STATE=$(mktemp)
+export STATE_FILE=$TEMP_STATE
+export SOCKS_PORT=45678
+export SOCKS_USERNAME=s5u_deadbeef
+export SOCKS_PASSWORD=abcdef0123456789abcdef01
+export ALLOW_CIDR=203.0.113.8/32
+export ALLOW_PRIVATE=0
+export EXTERNAL_INTERFACE=eth0
+export DANTE_BIN=/usr/sbin/danted
+export FIREWALL_BACKEND=ufw
+export FIREWALL_ZONE=""
+export AUTH_GROUP=s5g_deadbeef
+export AUTH_GROUP_GID=991
+export AUTH_USER_UID=992
+export DAEMON_USER=s5d_deadbeef
+export DAEMON_USER_UID=993
+export DAEMON_GROUP=s5d_deadbeef
+export DAEMON_GROUP_GID=994
+export INSTALLED_AT=2026-08-10T00:00:00Z
+export DANTE_WAS_PRESENT=0
+export DANTE_CONFIG_DIR_CREATED=1
+export SELINUX_ENABLED=1
+export SELINUX_PORT_MANAGED=1
+render_state >"$TEMP_STATE"
+load_state
+if [[ "$SOCKS_USERNAME" == "s5u_deadbeef" \
+    && "$SOCKS_PASSWORD" == "abcdef0123456789abcdef01" \
+    && "$SELINUX_PORT_MANAGED" == "1" ]]; then
+    pass "state round-trip preserves credentials and ownership markers"
+else
+    fail "state round-trip preserves credentials and ownership markers"
+fi
+
+printf '1..%d\n' "$TESTS_RUN"

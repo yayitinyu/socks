@@ -1,0 +1,132 @@
+# Linux VPS SOCKS5 一键节点
+
+这是一个基于 [Dante](https://www.inet.no/dante/) 的 SOCKS5 安装脚本。它会随机选择空闲高位端口、生成强随机凭据、创建 systemd 服务，并自动适配 VPS 上已经启用的防火墙。
+
+## 功能
+
+- 默认从 `20000-60000` 随机选择未监听的 TCP 端口
+- 随机生成独立的 SOCKS5 用户名与密码
+- 支持 Debian、Ubuntu、RHEL、Rocky Linux、AlmaLinux、CentOS Stream 和 Fedora 的常见 systemd 环境
+- 自动适配已启用的 UFW、firewalld、iptables 或 nftables
+- 在启用 SELinux 的系统上自动管理 `socks_port_t` 端口标签和文件上下文
+- 不会自动启用原本关闭的防火墙，避免意外中断 SSH
+- 默认阻止访问环回、内网、链路本地、云元数据和保留地址
+- 配置校验、服务监听检查、正误密码握手检查与真实 SOCKS5 出口自检
+- 支持安全查看安装信息和完整卸载
+
+脚本默认只开放 SOCKS5 的 TCP `CONNECT` 命令，适用于浏览器、下载工具和大多数应用代理场景，不提供 UDP Associate。
+
+## 一键安装
+
+直接在 VPS 上执行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/yayitinyu/socks/main/socks5.sh | sudo bash
+```
+
+如果需要先下载检查脚本内容，再安装：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/yayitinyu/socks/main/socks5.sh -o /tmp/socks5.sh \
+  && less /tmp/socks5.sh \
+  && sudo bash /tmp/socks5.sh
+```
+
+也可以手动上传脚本后执行：
+
+```bash
+sudo bash socks5.sh
+```
+
+一键安装时也可以传入参数，例如只允许指定公网 IP 连接：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/yayitinyu/socks/main/socks5.sh \
+  | sudo bash -s -- --allow-cidr 203.0.113.8/32
+```
+
+安装完成后会输出地址、端口、用户名、密码和 `socks5h://` 连接串。凭据也会以仅 root 可读的权限保存到 `/etc/socks5-node/state.env`，便于之后查看。Dante 配置单独放在 `/etc/socks/socks5-node.conf`，以兼容 RHEL/Fedora 的 SELinux Dante policy。
+
+## 自定义安装
+
+```bash
+sudo bash socks5.sh install \
+  --port 35678 \
+  --username myproxy \
+  --password 'ReplaceWithStrongPassword123' \
+  --allow-cidr 203.0.113.8/32
+```
+
+常用参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `--port PORT` | 指定 `1025-65535` 范围内的端口 |
+| `--username USER` | 指定新建的 SOCKS5 系统用户名 |
+| `--password PASS` | 指定 12-128 位安全字符密码 |
+| `--allow-cidr CIDR` | 只允许一个 IPv4 地址或网段连接 |
+| `--allow-private` | 允许代理访问 VPS 所在的私网和链路本地地址 |
+| `--no-firewall` | 完全不修改操作系统防火墙 |
+
+如果已安装，再次运行无参数安装命令只会恢复并显示现有服务，不会静默更换端口或凭据。要更改安装参数，请先卸载再重新安装。
+
+## 管理
+
+查看节点信息：
+
+```bash
+sudo bash socks5.sh info
+```
+
+查看状态和日志：
+
+```bash
+systemctl status socks5-node --no-pager
+journalctl -u socks5-node -f
+```
+
+卸载（交互确认）：
+
+```bash
+sudo bash socks5.sh uninstall
+```
+
+自动化环境中显式确认卸载：
+
+```bash
+sudo bash socks5.sh uninstall --yes
+```
+
+卸载会删除本脚本创建的服务、防火墙规则、凭据和托管账号，但会保留发行版安装的 Dante 软件包，避免误删其他程序的依赖。
+
+## 防火墙说明
+
+脚本只管理 VPS 操作系统内部的防火墙：
+
+- UFW：添加带 `socks5-node-端口` 注释的 IPv4 TCP 规则
+- firewalld：在出口网卡所属 zone 添加来源受限的 rich rule
+- iptables/nftables：添加带唯一注释的规则，并通过 systemd 在重启后恢复
+- 未检测到活动防火墙：不做修改，因为此时系统本身没有阻止该端口
+
+启用 SELinux 时，脚本不会关闭或切换到 Permissive 模式，而是为随机端口添加精确的 `socks_port_t` 本地映射；卸载时只删除本脚本创建的映射。若目标端口已有其他本地 SELinux 映射，脚本会换一个随机端口或拒绝覆盖用户指定端口。
+
+AWS Security Group、Google Cloud Firewall、Azure NSG、Oracle Cloud Security List 等云厂商外层防火墙无法由通用 VPS 脚本安全修改。如果服务正在监听但外部无法连接，请在服务商控制台放行输出端口的 TCP 入站流量。
+
+## 安全注意事项
+
+SOCKS5 的用户名/密码认证和代理流量本身**不提供传输加密**。凭据会阻止匿名滥用，但不能替代 TLS、SSH 隧道或 VPN。建议：
+
+- 使用 `--allow-cidr` 限制客户端公网 IP
+- 不要通过代理传输未使用 HTTPS/TLS 保护的敏感数据
+- 不需要访问私网时保留默认的私网目标拦截
+- 定期检查 `journalctl -u socks5-node` 中的异常连接
+
+## 本地校验
+
+```bash
+bash -n socks5.sh
+bash tests/test.sh
+shellcheck socks5.sh tests/test.sh
+```
+
+Windows 上的静态测试无法证明真实 Linux VPS 的 systemd、防火墙、系统密码认证与公网安全组行为；正式使用前应在目标发行版 VPS 上完成一次实际连接测试。
