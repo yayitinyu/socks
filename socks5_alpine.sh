@@ -1,5 +1,24 @@
 #!/usr/bin/env bash
 
+# If executed via /bin/sh on Alpine, attempt to re-exec with bash
+if [ -z "${BASH_VERSION:-}" ]; then
+    if ! command -v bash >/dev/null 2>&1; then
+        if command -v apk >/dev/null 2>&1; then
+            echo "正在通过 apk 安装 bash..." >&2
+            apk update >/dev/null 2>&1 && apk add --no-cache bash >/dev/null 2>&1 || {
+                echo "错误：无法自动安装 bash，请先手动执行 apk add bash" >&2
+                exit 1
+            }
+        else
+            echo "错误：运行此脚本需要 bash 解释器。" >&2
+            exit 1
+        fi
+    fi
+    if [ -f "$0" ]; then
+        exec bash "$0" "$@"
+    fi
+fi
+
 set -Eeuo pipefail
 IFS=$'\n\t'
 export LC_ALL=C
@@ -11,8 +30,9 @@ STATE_FILE="${CONFIG_DIR}/state.env"
 DANTE_CONFIG_DIR="/etc/socks"
 DANTE_CONFIG_FILE="${DANTE_CONFIG_DIR}/${APP_NAME}.conf"
 FIREWALL_HELPER="/usr/local/sbin/${APP_NAME}-firewall"
-SERVICE_UNIT="/etc/systemd/system/${APP_NAME}.service"
-FIREWALL_UNIT="/etc/systemd/system/${APP_NAME}-firewall.service"
+SERVICE_INIT="/etc/init.d/${APP_NAME}"
+FIREWALL_INIT="/etc/init.d/${APP_NAME}-firewall"
+LOG_FILE="/var/log/${APP_NAME}.log"
 
 ACTION="install"
 ASSUME_YES=0
@@ -92,12 +112,12 @@ die() {
 
 usage() {
     cat <<'EOF'
-Linux VPS SOCKS5 一键安装脚本
+Alpine Linux SOCKS5 一键安装脚本 (OpenRC)
 
 用法：
-  sudo bash socks5.sh [install] [选项]
-  sudo bash socks5.sh info
-  sudo bash socks5.sh uninstall [--yes]
+  sudo bash socks5_alpine.sh [install] [选项]
+  sudo bash socks5_alpine.sh info
+  sudo bash socks5_alpine.sh uninstall [--yes]
 
 安装选项：
   -p, --port PORT          指定监听端口；默认在 20000-60000 中随机选择
@@ -124,37 +144,77 @@ cleanup_temp_files() {
     done
 }
 
+service_is_active() {
+    local svc=${1:-$APP_NAME}
+    if command -v rc-service >/dev/null 2>&1; then
+        rc-service "$svc" status >/dev/null 2>&1
+    elif [[ -x "/etc/init.d/$svc" ]]; then
+        "/etc/init.d/$svc" status >/dev/null 2>&1
+    else
+        return 1
+    fi
+}
+
+service_restart() {
+    local svc=${1:-$APP_NAME}
+    if command -v rc-service >/dev/null 2>&1; then
+        rc-service "$svc" restart >/dev/null 2>&1 || rc-service "$svc" start >/dev/null 2>&1
+    elif [[ -x "/etc/init.d/$svc" ]]; then
+        "/etc/init.d/$svc" restart >/dev/null 2>&1 || "/etc/init.d/$svc" start >/dev/null 2>&1
+    else
+        return 1
+    fi
+}
+
+service_stop() {
+    local svc=${1:-$APP_NAME}
+    if command -v rc-service >/dev/null 2>&1; then
+        rc-service "$svc" stop >/dev/null 2>&1 || true
+    elif [[ -x "/etc/init.d/$svc" ]]; then
+        "/etc/init.d/$svc" stop >/dev/null 2>&1 || true
+    fi
+}
+
+service_enable() {
+    local svc=${1:-$APP_NAME}
+    if command -v rc-update >/dev/null 2>&1; then
+        rc-update add "$svc" default >/dev/null 2>&1 || true
+    fi
+}
+
+service_disable() {
+    local svc=${1:-$APP_NAME}
+    if command -v rc-update >/dev/null 2>&1; then
+        rc-update del "$svc" default >/dev/null 2>&1 || rc-update del "$svc" >/dev/null 2>&1 || true
+    fi
+}
+
 rollback_install() {
     log_warn "安装没有完成，正在回滚本次新建的服务、防火墙规则和账号。"
     set +e
 
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl disable --now "${APP_NAME}.service" >/dev/null 2>&1
-        systemctl disable --now "${APP_NAME}-firewall.service" >/dev/null 2>&1
-    fi
+    service_stop "${APP_NAME}"
+    service_stop "${APP_NAME}-firewall"
+    service_disable "${APP_NAME}"
+    service_disable "${APP_NAME}-firewall"
 
     if [[ -x "$FIREWALL_HELPER" ]]; then
         "$FIREWALL_HELPER" remove >/dev/null 2>&1
     fi
 
-    remove_selinux_port_mapping >/dev/null 2>&1
-
-    rm -f -- "$SERVICE_UNIT" "$FIREWALL_UNIT" "$FIREWALL_HELPER" "$DANTE_CONFIG_FILE"
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl daemon-reload >/dev/null 2>&1
-    fi
+    rm -f -- "$SERVICE_INIT" "$FIREWALL_INIT" "$FIREWALL_HELPER" "$DANTE_CONFIG_FILE" "$LOG_FILE"
 
     if ((AUTH_USER_CREATED == 1)) && id "$SOCKS_USERNAME" >/dev/null 2>&1; then
-        userdel "$SOCKS_USERNAME" >/dev/null 2>&1
+        remove_managed_user "$SOCKS_USERNAME" "$AUTH_USER_UID"
     fi
     if ((DAEMON_USER_CREATED == 1)) && id "$DAEMON_USER" >/dev/null 2>&1; then
-        userdel "$DAEMON_USER" >/dev/null 2>&1
+        remove_managed_user "$DAEMON_USER" "$DAEMON_USER_UID"
     fi
     if ((AUTH_GROUP_CREATED == 1)) && getent group "$AUTH_GROUP" >/dev/null 2>&1; then
-        groupdel "$AUTH_GROUP" >/dev/null 2>&1
+        remove_managed_group "$AUTH_GROUP" "$AUTH_GROUP_GID"
     fi
     if ((DAEMON_GROUP_CREATED == 1)) && getent group "$DAEMON_GROUP" >/dev/null 2>&1; then
-        groupdel "$DAEMON_GROUP" >/dev/null 2>&1
+        remove_managed_group "$DAEMON_GROUP" "$DAEMON_GROUP_GID"
     fi
 
     if [[ "$CONFIG_DIR" == "/etc/socks5-node" && -d "$CONFIG_DIR" ]]; then
@@ -246,7 +306,7 @@ parse_args() {
                 exit 0
                 ;;
             --version)
-                printf '%s %s\n' "$APP_NAME" "$SCRIPT_VERSION"
+                printf '%s %s (Alpine OpenRC)\n' "$APP_NAME" "$SCRIPT_VERSION"
                 exit 0
                 ;;
             *)
@@ -359,8 +419,6 @@ port_in_use() {
     ' /proc/net/tcp /proc/net/tcp6 2>/dev/null
 }
 
-# Dante may still be spawning workers when systemctl reports active.
-# Wait until the TCP listen socket is visible before running probes.
 wait_for_port_listen() {
     local port=$1
     local timeout_seconds=${2:-15}
@@ -371,7 +429,7 @@ wait_for_port_listen() {
         if port_in_use "$port"; then
             return 0
         fi
-        if ! systemctl is-active --quiet "${APP_NAME}.service"; then
+        if ! service_is_active "${APP_NAME}"; then
             return 1
         fi
         sleep 0.1
@@ -394,11 +452,21 @@ choose_random_port() {
     return 1
 }
 
-require_root_and_systemd() {
+require_root_and_openrc() {
     [[ "$(uname -s)" == "Linux" ]] || die "此脚本只能在 Linux 上运行。"
-    ((EUID == 0)) || die "请使用 root 运行，例如：sudo bash socks5.sh"
-    command -v systemctl >/dev/null 2>&1 || die "当前系统没有 systemd，暂不支持自动安装服务。"
-    [[ -d /run/systemd/system ]] || die "systemd 当前没有作为 PID 1 运行。"
+    ((EUID == 0)) || die "请使用 root 运行，例如：sudo bash socks5_alpine.sh 或以 root 身份执行。"
+
+    if [[ -r /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        source /etc/os-release
+        if [[ "${ID:-}" != "alpine" && "${ID_LIKE:-}" != *"alpine"* ]]; then
+            log_warn "当前系统检测为 ${PRETTY_NAME:-${NAME:-Linux}}，非标准 Alpine Linux。"
+        fi
+    fi
+
+    if ! command -v rc-service >/dev/null 2>&1 && ! command -v rc-update >/dev/null 2>&1 && [[ ! -f /sbin/openrc-run ]]; then
+        die "当前系统未检测到 OpenRC（缺少 rc-service/rc-update）。如果是 systemd 系统，请使用 socks5.sh。"
+    fi
 }
 
 acquire_lock() {
@@ -478,42 +546,39 @@ atomic_write() {
     mv -f -- "$temp_file" "$destination"
 }
 
-detect_platform() {
-    local os_name="Linux"
-    local os_version=""
+enable_alpine_community_repo() {
+    local repo_file="/etc/apk/repositories"
+    [[ -f "$repo_file" ]] || return 0
 
-    if [[ -r /etc/os-release ]]; then
-        # shellcheck disable=SC1091
-        source /etc/os-release
-        os_name=${PRETTY_NAME:-${NAME:-Linux}}
-        os_version=${VERSION_ID:-}
-    fi
-
-    log_info "检测到系统：${os_name}${os_version:+ (${os_version})}"
-
-    if command -v apt-get >/dev/null 2>&1; then
-        PACKAGE_MANAGER="apt"
-    elif command -v dnf >/dev/null 2>&1; then
-        PACKAGE_MANAGER="dnf"
-    elif command -v yum >/dev/null 2>&1; then
-        PACKAGE_MANAGER="yum"
-    else
-        die "暂不支持当前发行版；需要 apt、dnf 或 yum。"
+    if grep -q '^#[^#]*/community$' "$repo_file" 2>/dev/null; then
+        log_info "正在启用 Alpine community 软件源。"
+        sed -i 's|^#\([^#]*/community\)$|\1|' "$repo_file"
+    elif ! grep -q '/community$' "$repo_file" 2>/dev/null; then
+        local main_url
+        main_url=$(grep -E '^https?://.*/main$' "$repo_file" 2>/dev/null | head -n 1 || true)
+        if [[ -n "$main_url" ]]; then
+            local community_url="${main_url%/main}/community"
+            log_info "正在添加 Alpine community 软件源：${community_url}"
+            printf '%s\n' "$community_url" >> "$repo_file"
+        fi
     fi
 }
 
 find_dante_binary() {
-    if command -v danted >/dev/null 2>&1; then
-        command -v danted
-    elif command -v sockd >/dev/null 2>&1; then
+    if command -v sockd >/dev/null 2>&1; then
         command -v sockd
+    elif command -v danted >/dev/null 2>&1; then
+        command -v danted
+    elif [[ -x /usr/sbin/sockd ]]; then
+        printf '%s\n' "/usr/sbin/sockd"
+    elif [[ -x /usr/sbin/danted ]]; then
+        printf '%s\n' "/usr/sbin/danted"
     else
         return 1
     fi
 }
 
 install_dependencies() {
-    local package_manager=$1
     local -a packages=()
 
     if DANTE_BIN=$(find_dante_binary); then
@@ -521,199 +586,33 @@ install_dependencies() {
         log_info "检测到已有 Dante：${DANTE_BIN}，不会改动发行版自带配置。"
     fi
 
-    case "$package_manager" in
-        apt)
-            export DEBIAN_FRONTEND=noninteractive
-            packages=(curl ca-certificates iproute2 passwd)
-            if ((DANTE_WAS_PRESENT == 0)); then
-                packages+=(dante-server)
-            fi
-            apt-get update
-            apt-get install -y --no-install-recommends "${packages[@]}"
-            ;;
-        dnf | yum)
-            packages=(curl ca-certificates iproute shadow-utils)
-            if ((DANTE_WAS_PRESENT == 1)); then
-                "$package_manager" -y install "${packages[@]}"
-            elif ! "$package_manager" -y install dante-server "${packages[@]}"; then
-                log_info "默认软件源没有 dante-server，正在启用 EPEL。"
-                "$package_manager" -y install epel-release
-                "$package_manager" -y install dante-server "${packages[@]}"
-            fi
-            ;;
-        *)
-            die "未知包管理器：${package_manager}"
-            ;;
-    esac
+    if ! command -v apk >/dev/null 2>&1; then
+        die "未检测到 apk 包管理器，此脚本仅适用于 Alpine Linux。"
+    fi
 
-    DANTE_BIN=$(find_dante_binary) || die "安装完成后仍找不到 danted/sockd。"
+    enable_alpine_community_repo
+    apk update
+
+    packages=(curl ca-certificates iproute2 bash shadow)
+    if ((DANTE_WAS_PRESENT == 0)); then
+        packages+=(dante-server)
+    fi
+
+    log_info "正在安装所需软件包：${packages[*]}"
+    if ! apk add --no-cache "${packages[@]}"; then
+        log_warn "部分软件包安装重试中..."
+        apk add --no-cache curl ca-certificates iproute2 bash dante-server || die "安装依赖失败。"
+    fi
+
+    DANTE_BIN=$(find_dante_binary) || die "安装完成后仍找不到 sockd/danted。"
     command -v ip >/dev/null 2>&1 || die "找不到 ip 命令。"
-    command -v useradd >/dev/null 2>&1 || die "找不到 useradd 命令。"
-    command -v chpasswd >/dev/null 2>&1 || die "找不到 chpasswd 命令。"
 
     if ((DANTE_WAS_PRESENT == 0)); then
-        # 发行版服务使用它自己的配置；本项目使用独立 unit，避免出现第二个未认证监听端口。
-        systemctl disable --now danted.service >/dev/null 2>&1 || true
-        systemctl disable --now sockd.service >/dev/null 2>&1 || true
+        service_stop sockd
+        service_disable sockd
+        service_stop danted
+        service_disable danted
     fi
-}
-
-detect_selinux_state() {
-    local status="Disabled"
-
-    SELINUX_ENABLED=0
-    if command -v getenforce >/dev/null 2>&1; then
-        status=$(getenforce 2>/dev/null || true)
-    elif [[ -r /sys/fs/selinux/enforce ]]; then
-        status="Enforcing"
-    fi
-
-    case "$status" in
-        Enforcing | Permissive)
-            SELINUX_ENABLED=1
-            ;;
-    esac
-}
-
-ensure_selinux_tools() {
-    local allow_install=${1:-0}
-
-    detect_selinux_state
-    ((SELINUX_ENABLED == 1)) || return 0
-
-    if ! command -v semanage >/dev/null 2>&1 || ! command -v restorecon >/dev/null 2>&1; then
-        ((allow_install == 1)) || die "SELinux 已启用，但 semanage/restorecon 已缺失。"
-        log_info "SELinux 已启用，正在安装端口与文件标签管理工具。"
-        case "$PACKAGE_MANAGER" in
-            apt)
-                apt-get install -y --no-install-recommends policycoreutils policycoreutils-python-utils
-                ;;
-            dnf | yum)
-                if ! "$PACKAGE_MANAGER" -y install policycoreutils policycoreutils-python-utils; then
-                    "$PACKAGE_MANAGER" -y install policycoreutils policycoreutils-python
-                fi
-                ;;
-            *)
-                die "无法为 SELinux 安装管理工具。"
-                ;;
-        esac
-    fi
-
-    command -v semanage >/dev/null 2>&1 || die "SELinux 已启用，但找不到 semanage。"
-    command -v restorecon >/dev/null 2>&1 || die "SELinux 已启用，但找不到 restorecon。"
-}
-
-selinux_port_type_for() {
-    local port=$1
-    local local_only=${2:-0}
-    local -a command_line=(semanage port -l)
-
-    if ((local_only == 1)); then
-        command_line+=(-C)
-    fi
-
-    "${command_line[@]}" 2>/dev/null | awk -v target="$port" '
-        $2 == "tcp" {
-            for (i = 3; i <= NF; i++) {
-                token = $i
-                gsub(/,/, "", token)
-                if (token ~ /^[0-9]+$/ && token + 0 == target + 0) {
-                    print $1
-                    exit
-                }
-                if (token ~ /^[0-9]+-[0-9]+$/) {
-                    split(token, bounds, "-")
-                    if (target + 0 >= bounds[1] + 0 && target + 0 <= bounds[2] + 0) {
-                        print $1
-                        exit
-                    }
-                }
-            }
-        }
-    '
-}
-
-selinux_has_socks_port_type() {
-    semanage port -l 2>/dev/null | awk '
-        $1 == "socks_port_t" && $2 == "tcp" { found = 1 }
-        END { exit found ? 0 : 1 }
-    '
-}
-
-configure_selinux_port() {
-    local allow_random_reselect=${1:-0}
-    local allow_port_in_use=${2:-0}
-    local attempt local_type current_type
-
-    ((SELINUX_ENABLED == 1)) || return 0
-    if ! selinux_has_socks_port_type; then
-        log_warn "当前 SELinux policy 没有 socks_port_t，将由服务启动检查确认是否允许监听。"
-        return 0
-    fi
-
-    for ((attempt = 0; attempt < 64; attempt++)); do
-        if ((allow_port_in_use == 0)) && port_in_use "$SOCKS_PORT"; then
-            if ((allow_random_reselect == 1)) && [[ -z "$CLI_PORT" ]]; then
-                SOCKS_PORT=$(choose_random_port) || die "无法重新选择空闲高位端口。"
-                continue
-            fi
-            die "端口 ${SOCKS_PORT} 在安装依赖期间已被占用。"
-        fi
-
-        local_type=$(selinux_port_type_for "$SOCKS_PORT" 1)
-        if [[ -n "$local_type" && "$local_type" != "socks_port_t" ]]; then
-            if ((allow_random_reselect == 1)) && [[ -z "$CLI_PORT" ]]; then
-                SOCKS_PORT=$(choose_random_port) || die "无法重新选择 SELinux 兼容端口。"
-                continue
-            fi
-            die "TCP ${SOCKS_PORT} 已有本地 SELinux 类型 ${local_type}，拒绝覆盖。"
-        fi
-        break
-    done
-    ((attempt < 64)) || die "无法找到没有 SELinux 本地标签冲突的空闲端口。"
-
-    if [[ "$local_type" == "socks_port_t" ]]; then
-        return 0
-    fi
-
-    current_type=$(selinux_port_type_for "$SOCKS_PORT" 0)
-    if [[ "$current_type" == "socks_port_t" ]]; then
-        return 0
-    fi
-
-    if semanage port -a -t socks_port_t -p tcp "$SOCKS_PORT" >/dev/null 2>&1 \
-        || semanage port -m -t socks_port_t -p tcp "$SOCKS_PORT" >/dev/null 2>&1; then
-        SELINUX_PORT_MANAGED=1
-    else
-        die "无法把 TCP ${SOCKS_PORT} 标记为 socks_port_t。"
-    fi
-
-    local_type=$(selinux_port_type_for "$SOCKS_PORT" 1)
-    [[ "$local_type" == "socks_port_t" ]] || die "SELinux 端口标签写入后校验失败。"
-}
-
-remove_selinux_port_mapping() {
-    local local_type
-
-    ((SELINUX_PORT_MANAGED == 1)) || return 0
-    command -v semanage >/dev/null 2>&1 || return 1
-
-    local_type=$(selinux_port_type_for "$SOCKS_PORT" 1)
-    if [[ -z "$local_type" ]]; then
-        SELINUX_PORT_MANAGED=0
-        return 0
-    fi
-    [[ "$local_type" == "socks_port_t" ]] || return 1
-
-    semanage port -d -p tcp "$SOCKS_PORT"
-    SELINUX_PORT_MANAGED=0
-}
-
-restore_selinux_file_contexts() {
-    ((SELINUX_ENABLED == 1)) || return 0
-
-    restorecon "$DANTE_CONFIG_DIR" "$DANTE_CONFIG_FILE" "$FIREWALL_HELPER" \
-        "$SERVICE_UNIT" "$FIREWALL_UNIT"
 }
 
 detect_external_interface() {
@@ -780,24 +679,44 @@ generate_managed_identities() {
 create_managed_accounts() {
     local nologin_shell
 
-    nologin_shell=$(command -v nologin || true)
-    if [[ -z "$nologin_shell" ]]; then
-        nologin_shell=/bin/false
+    nologin_shell=$(command -v nologin 2>/dev/null || true)
+    if [[ -z "$nologin_shell" || ! -x "$nologin_shell" ]]; then
+        if [[ -x /sbin/nologin ]]; then
+            nologin_shell="/sbin/nologin"
+        else
+            nologin_shell="/bin/false"
+        fi
     fi
 
-    groupadd --system "$AUTH_GROUP"
+    if command -v groupadd >/dev/null 2>&1; then
+        groupadd --system "$AUTH_GROUP"
+    else
+        addgroup -S "$AUTH_GROUP"
+    fi
     AUTH_GROUP_CREATED=1
     AUTH_GROUP_GID=$(getent group "$AUTH_GROUP" | awk -F: '{print $3}')
 
-    groupadd --system "$DAEMON_GROUP"
+    if command -v groupadd >/dev/null 2>&1; then
+        groupadd --system "$DAEMON_GROUP"
+    else
+        addgroup -S "$DAEMON_GROUP"
+    fi
     DAEMON_GROUP_CREATED=1
     DAEMON_GROUP_GID=$(getent group "$DAEMON_GROUP" | awk -F: '{print $3}')
 
-    useradd --system --gid "$DAEMON_GROUP" --no-create-home --shell "$nologin_shell" "$DAEMON_USER"
+    if command -v useradd >/dev/null 2>&1; then
+        useradd --system --gid "$DAEMON_GROUP" --no-create-home --shell "$nologin_shell" "$DAEMON_USER"
+    else
+        adduser -S -D -H -s "$nologin_shell" -G "$DAEMON_GROUP" "$DAEMON_USER"
+    fi
     DAEMON_USER_CREATED=1
     DAEMON_USER_UID=$(id -u "$DAEMON_USER")
 
-    useradd --system --gid "$AUTH_GROUP" --no-create-home --shell "$nologin_shell" "$SOCKS_USERNAME"
+    if command -v useradd >/dev/null 2>&1; then
+        useradd --system --gid "$AUTH_GROUP" --no-create-home --shell "$nologin_shell" "$SOCKS_USERNAME"
+    else
+        adduser -S -D -H -s "$nologin_shell" -G "$AUTH_GROUP" "$SOCKS_USERNAME"
+    fi
     AUTH_USER_CREATED=1
     AUTH_USER_UID=$(id -u "$SOCKS_USERNAME")
     printf '%s:%s\n' "$SOCKS_USERNAME" "$SOCKS_PASSWORD" | chpasswd
@@ -820,7 +739,7 @@ render_dante_config() {
 
     cat <<EOF
 # Managed by socks5-node. Manual changes may be overwritten.
-logoutput: syslog
+logoutput: syslog ${LOG_FILE}
 
 internal: 0.0.0.0 port = ${SOCKS_PORT}
 external: ${EXTERNAL_INTERFACE}
@@ -862,31 +781,35 @@ socks pass {
 EOF
 }
 
-render_service_unit() {
+render_service_init() {
     cat <<EOF
-[Unit]
-Description=Managed SOCKS5 proxy node
-Documentation=https://www.inet.no/dante/
-After=network-online.target ${APP_NAME}-firewall.service
-Wants=network-online.target ${APP_NAME}-firewall.service
+#!/sbin/openrc-run
 
-[Service]
-Type=simple
-PIDFile=/run/${APP_NAME}/danted.pid
-ExecStart=${DANTE_BIN} -p /run/${APP_NAME}/danted.pid -f ${DANTE_CONFIG_FILE}
-ExecReload=/bin/kill -HUP \$MAINPID
-Restart=on-failure
-RestartSec=3s
-LimitNOFILE=65536
-RuntimeDirectory=${APP_NAME}
-RuntimeDirectoryMode=0750
-PrivateTmp=true
-ProtectHome=true
-ProtectSystem=strict
-ReadWritePaths=/run/${APP_NAME}
+name="${APP_NAME}"
+description="Managed SOCKS5 proxy node"
 
-[Install]
-WantedBy=multi-user.target
+command="${DANTE_BIN}"
+command_args="-D -p /run/${APP_NAME}/sockd.pid -f ${DANTE_CONFIG_FILE}"
+pidfile="/run/${APP_NAME}/sockd.pid"
+
+depend() {
+    need net
+    after firewall iptables nftables ufw ${APP_NAME}-firewall
+}
+
+start_pre() {
+    checkpath -d -m 0750 -o root:root /run/${APP_NAME}
+    checkpath -d -m 0755 -o root:root "${DANTE_CONFIG_DIR}"
+    checkpath -f -m 0644 -o root:root "${LOG_FILE}"
+}
+
+extra_started_commands="reload"
+
+reload() {
+    ebegin "Reloading \${name}"
+    start-stop-daemon --signal HUP --pidfile "\${pidfile}"
+    eend \$?
+}
 EOF
 }
 
@@ -1047,7 +970,6 @@ ufw_remove() {
             ufw --force delete "$number" >/dev/null
         done
     else
-        # `ufw status numbered` hides rules while UFW is inactive; delete the exact IPv4 rule instead.
         ufw --force delete allow proto tcp from "$ALLOW_CIDR" to any port "$PORT" >/dev/null 2>&1 || true
     fi
 
@@ -1189,21 +1111,30 @@ main "$@"
 EOF
 }
 
-render_firewall_unit() {
+render_firewall_init() {
     cat <<EOF
-[Unit]
-Description=Firewall rule for managed SOCKS5 proxy node
-After=ufw.service firewalld.service nftables.service iptables.service netfilter-persistent.service
-Before=${APP_NAME}.service
+#!/sbin/openrc-run
 
-[Service]
-Type=oneshot
-ExecStart=${FIREWALL_HELPER} add
-ExecStop=${FIREWALL_HELPER} remove
-RemainAfterExit=yes
+name="${APP_NAME}-firewall"
+description="Firewall rule for managed SOCKS5 proxy node"
 
-[Install]
-WantedBy=multi-user.target
+depend() {
+    need net
+    after firewall iptables nftables ufw
+    before ${APP_NAME}
+}
+
+start() {
+    ebegin "Applying SOCKS5 firewall rules"
+    ${FIREWALL_HELPER} add
+    eend \$?
+}
+
+stop() {
+    ebegin "Removing SOCKS5 firewall rules"
+    ${FIREWALL_HELPER} remove
+    eend \$?
+}
 EOF
 }
 
@@ -1274,7 +1205,7 @@ EOF
     if is_valid_ipv4 "$proxy_ip"; then
         log_success "SOCKS5 用户名/密码与外网转发测试通过（出口 ${proxy_ip}）。"
     else
-        log_warn "服务已监听，但外网转发自检未通过；请用 journalctl 查看日志。"
+        log_warn "服务已监听，但外网转发自检未通过；请检查日志 ${LOG_FILE}。"
     fi
 }
 
@@ -1314,7 +1245,9 @@ verify_socks5_authentication() {
     local invalid_password="${SOCKS_PASSWORD}0"
 
     if ! socks5_authenticate "$SOCKS_PASSWORD"; then
-        journalctl -u "${APP_NAME}.service" -n 30 --no-pager >&2 || true
+        if [[ -f "$LOG_FILE" ]]; then
+            tail -n 30 "$LOG_FILE" >&2 || true
+        fi
         die "SOCKS5 正确凭据认证失败。"
     fi
     if socks5_authenticate "$invalid_password"; then
@@ -1325,22 +1258,16 @@ verify_socks5_authentication() {
 
 print_runtime_status() {
     local service_status="未运行"
-    local public_ip dante_version_output dante_version selinux_status="未启用"
+    local public_ip dante_version_output dante_version
 
-    if systemctl is-active --quiet "${APP_NAME}.service"; then
+    if service_is_active "${APP_NAME}"; then
         service_status="运行中"
     fi
     public_ip=$(discover_public_ipv4)
     dante_version_output=$("$DANTE_BIN" -v 2>&1 || true)
     dante_version=$(sed -n '1p' <<<"$dante_version_output")
-    if ((SELINUX_ENABLED == 1)); then
-        selinux_status="已适配"
-        if ((SELINUX_PORT_MANAGED == 1)); then
-            selinux_status+="（托管 socks_port_t）"
-        fi
-    fi
 
-    printf '\n%sSOCKS5 节点信息%s\n' "$COLOR_BOLD" "$COLOR_RESET"
+    printf '\n%sSOCKS5 节点信息 (Alpine OpenRC)%s\n' "$COLOR_BOLD" "$COLOR_RESET"
     printf '  状态：       %s\n' "$service_status"
     printf '  地址：       %s\n' "$public_ip"
     printf '  端口：       %s\n' "$SOCKS_PORT"
@@ -1350,14 +1277,14 @@ print_runtime_status() {
         "$SOCKS_USERNAME" "$SOCKS_PASSWORD" "$public_ip" "$SOCKS_PORT"
     printf '  允许来源：   %s\n' "$ALLOW_CIDR"
     printf '  防火墙：     %s%s\n' "$FIREWALL_BACKEND" "${FIREWALL_ZONE:+ (${FIREWALL_ZONE})}"
-    printf '  SELinux：    %s\n' "$selinux_status"
     printf '  出口网卡：   %s\n' "$EXTERNAL_INTERFACE"
     printf '  Dante：      %s\n' "${dante_version:-未知版本}"
     printf '  安装时间：   %s\n' "${INSTALLED_AT:-未知}"
     printf '\n'
-    printf '查看日志：journalctl -u %s -f\n' "$APP_NAME"
-    printf '查看信息：sudo bash socks5.sh info\n'
-    printf '卸载节点：sudo bash socks5.sh uninstall\n'
+    printf '服务管理：rc-service %s {status|restart|stop}\n' "$APP_NAME"
+    printf '查看日志：tail -f %s\n' "$LOG_FILE"
+    printf '查看信息：sudo bash socks5_alpine.sh info\n'
+    printf '卸载节点：sudo bash socks5_alpine.sh uninstall\n'
     printf '\n'
     log_warn "标准 SOCKS5 用户名/密码不会加密传输；不要在不可信网络中传递敏感明文数据。"
     log_warn "云厂商安全组不属于 VPS 系统防火墙，如仍无法连接，请手动放行 TCP ${SOCKS_PORT}。"
@@ -1368,7 +1295,7 @@ ensure_existing_install_running() {
 
     [[ -f "$DANTE_CONFIG_FILE" ]] || die "状态文件存在，但 Dante 配置缺失。"
     [[ -x "$FIREWALL_HELPER" ]] || die "状态文件存在，但防火墙辅助脚本缺失。"
-    [[ -f "$SERVICE_UNIT" && -f "$FIREWALL_UNIT" ]] || die "状态文件存在，但 systemd unit 缺失。"
+    [[ -f "$SERVICE_INIT" && -f "$FIREWALL_INIT" ]] || die "状态文件存在，但 OpenRC init 脚本缺失。"
     [[ -x "$DANTE_BIN" ]] || die "状态文件记录的 Dante 程序不存在：${DANTE_BIN}"
 
     [[ "$(id -u "$SOCKS_USERNAME" 2>/dev/null || true)" == "$AUTH_USER_UID" ]] \
@@ -1382,23 +1309,22 @@ ensure_existing_install_running() {
     [[ "$current_daemon_gid" == "$DAEMON_GROUP_GID" && "$(id -gn "$DAEMON_USER")" == "$DAEMON_GROUP" ]] \
         || die "托管守护用户组缺失或 GID 已变化。"
 
-    ensure_selinux_tools 0
-    configure_selinux_port 0 1
     printf '%s:%s\n' "$SOCKS_USERNAME" "$SOCKS_PASSWORD" | chpasswd
     atomic_write "$DANTE_CONFIG_FILE" 600 render_dante_config
     atomic_write "$FIREWALL_HELPER" 700 render_firewall_helper
-    atomic_write "$SERVICE_UNIT" 644 render_service_unit
-    atomic_write "$FIREWALL_UNIT" 644 render_firewall_unit
-    restore_selinux_file_contexts
+    atomic_write "$SERVICE_INIT" 755 render_service_init
+    atomic_write "$FIREWALL_INIT" 755 render_firewall_init
     validate_dante_config
 
-    systemctl daemon-reload
-    systemctl enable "${APP_NAME}-firewall.service" "${APP_NAME}.service" >/dev/null
-    systemctl restart "${APP_NAME}-firewall.service"
-    systemctl restart "${APP_NAME}.service"
-    systemctl is-active --quiet "${APP_NAME}.service" || die "恢复后 SOCKS5 服务仍未运行。"
+    service_enable "${APP_NAME}-firewall"
+    service_enable "${APP_NAME}"
+    service_restart "${APP_NAME}-firewall"
+    service_restart "${APP_NAME}"
+    service_is_active "${APP_NAME}" || die "恢复后 SOCKS5 服务仍未运行。"
     if ! wait_for_port_listen "$SOCKS_PORT" 15; then
-        journalctl -u "${APP_NAME}.service" -n 30 --no-pager >&2 || true
+        if [[ -f "$LOG_FILE" ]]; then
+            tail -n 30 "$LOG_FILE" >&2 || true
+        fi
         die "恢复后服务在运行，但端口 ${SOCKS_PORT} 没有监听。"
     fi
     verify_socks5_authentication
@@ -1418,14 +1344,10 @@ preflight_new_install() {
         conflict=$DANTE_CONFIG_FILE
     elif [[ -e "$FIREWALL_HELPER" ]]; then
         conflict=$FIREWALL_HELPER
-    elif [[ -e "$SERVICE_UNIT" ]]; then
-        conflict=$SERVICE_UNIT
-    elif [[ -e "$FIREWALL_UNIT" ]]; then
-        conflict=$FIREWALL_UNIT
-    elif systemctl cat "${APP_NAME}.service" >/dev/null 2>&1; then
-        conflict="已有 systemd unit：${APP_NAME}.service"
-    elif systemctl cat "${APP_NAME}-firewall.service" >/dev/null 2>&1; then
-        conflict="已有 systemd unit：${APP_NAME}-firewall.service"
+    elif [[ -e "$SERVICE_INIT" ]]; then
+        conflict=$SERVICE_INIT
+    elif [[ -e "$FIREWALL_INIT" ]]; then
+        conflict=$FIREWALL_INIT
     fi
 
     [[ -z "$conflict" ]] || die "发现不受状态文件管理的残留路径：${conflict}。请先人工检查，脚本不会覆盖。"
@@ -1467,8 +1389,7 @@ install_action() {
     fi
     ALLOW_PRIVATE=$CLI_ALLOW_PRIVATE
 
-    detect_platform
-    install_dependencies "$PACKAGE_MANAGER"
+    install_dependencies
     if port_in_use "$SOCKS_PORT"; then
         if [[ -z "$CLI_PORT" ]]; then
             SOCKS_PORT=$(choose_random_port) || die "安装依赖后无法重新选择空闲高位端口。"
@@ -1476,8 +1397,6 @@ install_action() {
             die "端口 ${SOCKS_PORT} 在安装依赖期间已被占用。"
         fi
     fi
-    ensure_selinux_tools 1
-    configure_selinux_port 1 0
     EXTERNAL_INTERFACE=$(detect_external_interface)
     log_info "IPv4 出口网卡：${EXTERNAL_INTERFACE}"
 
@@ -1492,6 +1411,8 @@ install_action() {
         DANTE_CONFIG_DIR_CREATED=1
     fi
     mkdir -p "$(dirname -- "$FIREWALL_HELPER")"
+    touch "$LOG_FILE"
+    chmod 644 "$LOG_FILE"
 
     FIREWALL_BACKEND=$(detect_firewall_backend)
     if [[ "$FIREWALL_BACKEND" == "firewalld" ]]; then
@@ -1500,25 +1421,29 @@ install_action() {
 
     atomic_write "$DANTE_CONFIG_FILE" 600 render_dante_config
     atomic_write "$FIREWALL_HELPER" 700 render_firewall_helper
-    atomic_write "$SERVICE_UNIT" 644 render_service_unit
-    atomic_write "$FIREWALL_UNIT" 644 render_firewall_unit
-    restore_selinux_file_contexts
+    atomic_write "$SERVICE_INIT" 755 render_service_init
+    atomic_write "$FIREWALL_INIT" 755 render_firewall_init
 
     log_info "正在校验 Dante 配置。"
     validate_dante_config
 
-    systemctl daemon-reload
     log_info "正在应用防火墙规则（${FIREWALL_BACKEND}${FIREWALL_ZONE:+/${FIREWALL_ZONE}}）。"
-    systemctl enable --now "${APP_NAME}-firewall.service"
-    systemctl enable --now "${APP_NAME}.service"
+    service_enable "${APP_NAME}-firewall"
+    service_enable "${APP_NAME}"
+    service_restart "${APP_NAME}-firewall"
+    service_restart "${APP_NAME}"
 
-    systemctl is-active --quiet "${APP_NAME}.service" || {
-        journalctl -u "${APP_NAME}.service" -n 30 --no-pager >&2 || true
+    service_is_active "${APP_NAME}" || {
+        if [[ -f "$LOG_FILE" ]]; then
+            tail -n 30 "$LOG_FILE" >&2 || true
+        fi
         die "SOCKS5 服务启动失败。"
     }
 
     if ! wait_for_port_listen "$SOCKS_PORT" 15; then
-        journalctl -u "${APP_NAME}.service" -n 30 --no-pager >&2 || true
+        if [[ -f "$LOG_FILE" ]]; then
+            tail -n 30 "$LOG_FILE" >&2 || true
+        fi
         die "服务已启动，但端口 ${SOCKS_PORT} 没有监听。"
     fi
 
@@ -1545,15 +1470,19 @@ numeric_group_id() {
 
 remove_managed_user() {
     local username=$1
-    local expected_uid=$2
+    local expected_uid=${2:-}
     local current_uid
 
     if ! id "$username" >/dev/null 2>&1; then
         return
     fi
     current_uid=$(id -u "$username")
-    if [[ -n "$expected_uid" && "$current_uid" == "$expected_uid" ]]; then
-        userdel "$username"
+    if [[ -z "$expected_uid" || "$current_uid" == "$expected_uid" ]]; then
+        if command -v userdel >/dev/null 2>&1; then
+            userdel "$username" 2>/dev/null || true
+        elif command -v deluser >/dev/null 2>&1; then
+            deluser "$username" 2>/dev/null || true
+        fi
     else
         log_warn "账号 ${username} 的 UID 已变化，未自动删除。"
     fi
@@ -1561,15 +1490,19 @@ remove_managed_user() {
 
 remove_managed_group() {
     local group_name=$1
-    local expected_gid=$2
+    local expected_gid=${2:-}
     local current_gid
 
     if ! getent group "$group_name" >/dev/null 2>&1; then
         return
     fi
     current_gid=$(numeric_group_id "$group_name")
-    if [[ -n "$expected_gid" && "$current_gid" == "$expected_gid" ]]; then
-        groupdel "$group_name"
+    if [[ -z "$expected_gid" || "$current_gid" == "$expected_gid" ]]; then
+        if command -v groupdel >/dev/null 2>&1; then
+            groupdel "$group_name" 2>/dev/null || true
+        elif command -v delgroup >/dev/null 2>&1; then
+            delgroup "$group_name" 2>/dev/null || true
+        fi
     else
         log_warn "用户组 ${group_name} 的 GID 已变化，未自动删除。"
     fi
@@ -1600,23 +1533,20 @@ uninstall_action() {
         return
     fi
 
-    systemctl disable --now "${APP_NAME}.service" >/dev/null 2>&1 || true
-    systemctl disable --now "${APP_NAME}-firewall.service" >/dev/null 2>&1 || true
+    service_stop "${APP_NAME}"
+    service_stop "${APP_NAME}-firewall"
+    service_disable "${APP_NAME}"
+    service_disable "${APP_NAME}-firewall"
+
     if [[ -x "$FIREWALL_HELPER" ]]; then
         if ! "$FIREWALL_HELPER" remove; then
             log_warn "防火墙规则自动清理失败，请检查端口 ${SOCKS_PORT}。"
             cleanup_failed=1
         fi
     fi
-    if ! remove_selinux_port_mapping; then
-        log_warn "SELinux 端口标签自动清理失败，请检查 TCP ${SOCKS_PORT}。"
-        cleanup_failed=1
-    fi
     ((cleanup_failed == 0)) || die "卸载已暂停，状态文件与辅助脚本仍保留；修复上述问题后可重试。"
 
-    rm -f -- "$SERVICE_UNIT" "$FIREWALL_UNIT" "$FIREWALL_HELPER" "$DANTE_CONFIG_FILE"
-    systemctl daemon-reload
-    systemctl reset-failed >/dev/null 2>&1 || true
+    rm -f -- "$SERVICE_INIT" "$FIREWALL_INIT" "$FIREWALL_HELPER" "$DANTE_CONFIG_FILE" "$LOG_FILE"
 
     remove_managed_user "$SOCKS_USERNAME" "$AUTH_USER_UID"
     remove_managed_user "$DAEMON_USER" "$DAEMON_USER_UID"
@@ -1637,7 +1567,7 @@ uninstall_action() {
 
 main() {
     parse_args "$@"
-    require_root_and_systemd
+    require_root_and_openrc
     acquire_lock
 
     case "$ACTION" in

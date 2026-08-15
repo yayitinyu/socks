@@ -451,4 +451,109 @@ else
     fail "state round-trip preserves credentials and ownership markers"
 fi
 
+# ==================== Alpine OpenRC Tests ====================
+ALPINESCRIPT_PATH="${PROJECT_DIR}/socks5_alpine.sh"
+assert_true "socks5_alpine.sh has valid Bash syntax" bash -n "$ALPINESCRIPT_PATH"
+
+TEMP_ALPINE_SERVICE=$(mktemp)
+TEMP_ALPINE_FIREWALL_INIT=$(mktemp)
+TEMP_ALPINE_CONFIG=$(mktemp)
+TEMP_ALPINE_STATE=$(mktemp)
+
+# Source socks5_alpine.sh in isolation
+(
+    export SOCKS5_NODE_LIB_ONLY=1
+    # shellcheck disable=SC1090
+    source "$ALPINESCRIPT_PATH"
+
+    export SOCKS_PORT=45678
+    export EXTERNAL_INTERFACE=eth0
+    export DAEMON_USER=s5d_deadbeef
+    export AUTH_GROUP=s5g_deadbeef
+    export ALLOW_CIDR=203.0.113.8/32
+    export ALLOW_PRIVATE=0
+    export DANTE_BIN=/usr/sbin/sockd
+    export LOG_FILE=/var/log/socks5-node.log
+
+    render_dante_config >"$TEMP_ALPINE_CONFIG"
+    render_service_init >"$TEMP_ALPINE_SERVICE"
+    render_firewall_init >"$TEMP_ALPINE_FIREWALL_INIT"
+
+    export STATE_FILE=$TEMP_ALPINE_STATE
+    export SOCKS_USERNAME=s5u_deadbeef
+    export SOCKS_PASSWORD=abcdef0123456789abcdef01
+    export FIREWALL_BACKEND=iptables
+    export FIREWALL_ZONE=""
+    export AUTH_GROUP_GID=991
+    export AUTH_USER_UID=992
+    export DAEMON_USER_UID=993
+    export DAEMON_GROUP=s5d_deadbeef
+    export DAEMON_GROUP_GID=994
+    export INSTALLED_AT=2026-08-10T00:00:00Z
+    export DANTE_WAS_PRESENT=0
+    export DANTE_CONFIG_DIR_CREATED=1
+    export SELINUX_ENABLED=0
+    export SELINUX_PORT_MANAGED=0
+    render_state >"$TEMP_ALPINE_STATE"
+    load_state
+    [[ "$SOCKS_USERNAME" == "s5u_deadbeef" && "$SOCKS_PASSWORD" == "abcdef0123456789abcdef01" ]]
+) || fail "socks5_alpine.sh basic runtime execution"
+pass "socks5_alpine.sh basic runtime execution"
+
+assert_contains "Alpine service init uses openrc-run shebang" "$TEMP_ALPINE_SERVICE" "#!/sbin/openrc-run"
+assert_contains "Alpine service init executes sockd" "$TEMP_ALPINE_SERVICE" 'command="/usr/sbin/sockd"'
+assert_contains "Alpine service init passes daemon arguments" "$TEMP_ALPINE_SERVICE" 'command_args="-D -p /run/socks5-node/sockd.pid -f /etc/socks/socks5-node.conf"'
+assert_contains "Alpine service init specifies pidfile" "$TEMP_ALPINE_SERVICE" 'pidfile="/run/socks5-node/sockd.pid"'
+assert_contains "Alpine service init creates logfile and runtime directory" "$TEMP_ALPINE_SERVICE" 'checkpath -f -m 0644 -o root:root "/var/log/socks5-node.log"'
+
+assert_contains "Alpine firewall init uses openrc-run shebang" "$TEMP_ALPINE_FIREWALL_INIT" "#!/sbin/openrc-run"
+assert_contains "Alpine firewall init calls helper add" "$TEMP_ALPINE_FIREWALL_INIT" '/usr/local/sbin/socks5-node-firewall add'
+assert_contains "Alpine firewall init calls helper remove" "$TEMP_ALPINE_FIREWALL_INIT" '/usr/local/sbin/socks5-node-firewall remove'
+
+assert_contains "Alpine Dante config logs to file" "$TEMP_ALPINE_CONFIG" "logoutput: syslog /var/log/socks5-node.log"
+assert_contains "Alpine Dante config binds high port" "$TEMP_ALPINE_CONFIG" "internal: 0.0.0.0 port = 45678"
+
+# Test CLI args and environment port parsing
+(
+    export SOCKS5_NODE_LIB_ONLY=1
+    # shellcheck disable=SC1090
+    source "$SCRIPT_PATH"
+    parse_args -p 35678
+    [[ "$CLI_PORT" == "35678" && "$CONFIG_OVERRIDES" -eq 1 ]]
+) || fail "parse_args handles CLI -p flag"
+pass "parse_args handles CLI -p flag"
+
+(
+    export SOCKS5_NODE_LIB_ONLY=1
+    export PORT=35679
+    # shellcheck disable=SC1090
+    source "$SCRIPT_PATH"
+    parse_args
+    [[ "$CLI_PORT" == "35679" && "$CONFIG_OVERRIDES" -eq 1 ]]
+) || fail "parse_args handles PORT environment variable"
+pass "parse_args handles PORT environment variable"
+
+(
+    export SOCKS5_NODE_LIB_ONLY=1
+    # shellcheck disable=SC1090
+    source "$ALPINESCRIPT_PATH"
+    parse_args --port 35680
+    [[ "$CLI_PORT" == "35680" && "$CONFIG_OVERRIDES" -eq 1 ]]
+) || fail "Alpine parse_args handles CLI --port flag"
+pass "Alpine parse_args handles CLI --port flag"
+
+(
+    export SOCKS5_NODE_LIB_ONLY=1
+    export PORT=35681
+    # shellcheck disable=SC1090
+    source "$ALPINESCRIPT_PATH"
+    parse_args
+    [[ "$CLI_PORT" == "35681" && "$CONFIG_OVERRIDES" -eq 1 ]]
+) || fail "Alpine parse_args handles PORT environment variable"
+pass "Alpine parse_args handles PORT environment variable"
+
+rm -f -- "$TEMP_ALPINE_SERVICE" "$TEMP_ALPINE_FIREWALL_INIT" "$TEMP_ALPINE_CONFIG" "$TEMP_ALPINE_STATE"
+
 printf '1..%d\n' "$TESTS_RUN"
+
+

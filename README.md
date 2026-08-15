@@ -18,39 +18,88 @@
 
 ## 一键安装
 
-直接在 VPS 上执行：
+### 通用 Linux（Debian / Ubuntu / RHEL / Rocky / Fedora 等 systemd 环境）
+
+**1. 默认随机端口（20000-60000）一键安装：**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/yayitinyu/socks/main/socks5.sh | sudo bash
 ```
 
-如果需要先下载检查脚本内容，再安装：
+**2. 自定义指定端口（例如指定端口 35678）：**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/yayitinyu/socks/main/socks5.sh -o /tmp/socks5.sh \
-  && less /tmp/socks5.sh \
-  && sudo bash /tmp/socks5.sh
+curl -fsSL https://raw.githubusercontent.com/yayitinyu/socks/main/socks5.sh | sudo bash -s -- --port 35678
 ```
 
-也可以手动上传脚本后执行：
+也可通过环境变量指定端口：
 
 ```bash
-sudo bash socks5.sh
+curl -fsSL https://raw.githubusercontent.com/yayitinyu/socks/main/socks5.sh | sudo PORT=35678 bash
 ```
 
-一键安装时也可以传入参数，例如只允许指定公网 IP 连接：
+**3. 限制只允许指定公网 IP 连接：**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/yayitinyu/socks/main/socks5.sh \
-  | sudo bash -s -- --allow-cidr 203.0.113.8/32
+  | sudo bash -s -- --port 35678 --allow-cidr 203.0.113.8/32
 ```
 
-安装完成后会输出地址、端口、用户名、密码和 `socks5h://` 连接串。凭据也会以仅 root 可读的权限保存到 `/etc/socks5-node/state.env`，便于之后查看。Dante 配置单独放在 `/etc/socks/socks5-node.conf`，以兼容 RHEL/Fedora 的 SELinux Dante policy。
+---
+
+### Alpine Linux（OpenRC 环境）
+
+**1. 默认随机端口（20000-60000）一键安装：**
+
+```bash
+apk add --no-cache curl bash && curl -fsSL https://raw.githubusercontent.com/yayitinyu/socks/main/socks5_alpine.sh | bash
+```
+
+若使用 `wget`：
+
+```bash
+apk add --no-cache wget bash && wget -qO- https://raw.githubusercontent.com/yayitinyu/socks/main/socks5_alpine.sh | bash
+```
+
+**2. 自定义指定端口（例如指定端口 35678）：**
+
+```bash
+apk add --no-cache curl bash && curl -fsSL https://raw.githubusercontent.com/yayitinyu/socks/main/socks5_alpine.sh \
+  | bash -s -- --port 35678
+```
+
+也可通过环境变量指定端口：
+
+```bash
+apk add --no-cache curl bash && curl -fsSL https://raw.githubusercontent.com/yayitinyu/socks/main/socks5_alpine.sh \
+  | PORT=35678 bash
+```
+
+**3. 限制只允许指定公网 IP 连接：**
+
+```bash
+apk add --no-cache curl bash && curl -fsSL https://raw.githubusercontent.com/yayitinyu/socks/main/socks5_alpine.sh \
+  | bash -s -- --port 35678 --allow-cidr 203.0.113.8/32
+```
+
+安装完成后会输出地址、端口、用户名、密码和 `socks5h://` 连接串。凭据也会以仅 root 可读的权限保存到 `/etc/socks5-node/state.env`，便于之后查看。Dante 配置单独放在 `/etc/socks/socks5-node.conf`。
 
 ## 自定义安装
 
+通用 Linux：
+
 ```bash
 sudo bash socks5.sh install \
+  --port 35678 \
+  --username myproxy \
+  --password 'ReplaceWithStrongPassword123' \
+  --allow-cidr 203.0.113.8/32
+```
+
+Alpine Linux：
+
+```bash
+sudo bash socks5_alpine.sh install \
   --port 35678 \
   --username myproxy \
   --password 'ReplaceWithStrongPassword123' \
@@ -71,6 +120,8 @@ sudo bash socks5.sh install \
 如果已安装，再次运行无参数安装命令只会恢复并显示现有服务，不会静默更换端口或凭据。要更改安装参数，请先卸载再重新安装。
 
 ## 管理
+
+### 通用 Linux (systemd)
 
 查看节点信息：
 
@@ -97,6 +148,33 @@ sudo bash socks5.sh uninstall
 sudo bash socks5.sh uninstall --yes
 ```
 
+### Alpine Linux (OpenRC)
+
+查看节点信息：
+
+```bash
+sudo bash socks5_alpine.sh info
+```
+
+查看状态和日志：
+
+```bash
+rc-service socks5-node status
+tail -f /var/log/socks5-node.log
+```
+
+卸载（交互确认）：
+
+```bash
+sudo bash socks5_alpine.sh uninstall
+```
+
+自动化环境中显式确认卸载：
+
+```bash
+sudo bash socks5_alpine.sh uninstall --yes
+```
+
 卸载会删除本脚本创建的服务、防火墙规则、凭据和托管账号，但会保留发行版安装的 Dante 软件包，避免误删其他程序的依赖。
 
 ## 防火墙说明
@@ -105,10 +183,10 @@ sudo bash socks5.sh uninstall --yes
 
 - UFW：添加带 `socks5-node-端口` 注释的 IPv4 TCP 规则
 - firewalld：在出口网卡所属 zone 添加来源受限的 rich rule
-- iptables/nftables：添加带唯一注释的规则，并通过 systemd 在重启后恢复
+- iptables/nftables：添加带唯一注释的规则，并通过系统服务在重启后恢复
 - 未检测到活动防火墙：不做修改，因为此时系统本身没有阻止该端口
 
-启用 SELinux 时，脚本不会关闭或切换到 Permissive 模式，而是为随机端口添加精确的 `socks_port_t` 本地映射；卸载时只删除本脚本创建的映射。若目标端口已有其他本地 SELinux 映射，脚本会换一个随机端口或拒绝覆盖用户指定端口。
+启用 SELinux 时（如 RHEL/Fedora），脚本不会关闭或切换到 Permissive 模式，而是为随机端口添加精确的 `socks_port_t` 本地映射；卸载时只删除本脚本创建的映射。若目标端口已有其他本地 SELinux 映射，脚本会换一个随机端口或拒绝覆盖用户指定端口。
 
 AWS Security Group、Google Cloud Firewall、Azure NSG、Oracle Cloud Security List 等云厂商外层防火墙无法由通用 VPS 脚本安全修改。如果服务正在监听但外部无法连接，请在服务商控制台放行输出端口的 TCP 入站流量。
 
@@ -119,14 +197,15 @@ SOCKS5 的用户名/密码认证和代理流量本身**不提供传输加密**�
 - 使用 `--allow-cidr` 限制客户端公网 IP
 - 不要通过代理传输未使用 HTTPS/TLS 保护的敏感数据
 - 不需要访问私网时保留默认的私网目标拦截
-- 定期检查 `journalctl -u socks5-node` 中的异常连接
+- 定期检查日志中的异常连接
 
 ## 本地校验
 
 ```bash
 bash -n socks5.sh
+bash -n socks5_alpine.sh
 bash tests/test.sh
-shellcheck socks5.sh tests/test.sh
 ```
 
-Windows 上的静态测试无法证明真实 Linux VPS 的 systemd、防火墙、系统密码认证与公网安全组行为；正式使用前应在目标发行版 VPS 上完成一次实际连接测试。
+Windows 上的静态测试无法证明真实 Linux VPS 的服务管理器、防火墙、系统密码认证与公网安全组行为；正式使用前应在目标发行版 VPS 上完成一次实际连接测试。
+
