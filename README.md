@@ -128,64 +128,57 @@ bash socks5_alpine.sh install \
 | `--allow-cidr CIDR` | 只允许一个 IPv4 地址或网段连接 |
 | `--allow-private` | 允许代理访问 VPS 所在的私网和链路本地地址 |
 | `--no-firewall` | 完全不修改操作系统防火墙 |
+| `-f, --force` | 覆盖已有的旧节点安装并应用新参数 |
 
-如果已安装，再次运行无参数安装命令只会恢复并显示现有服务，不会静默更换端口或凭据。要更改安装参数，请先卸载再重新安装。
+安装完成后，系统会自动配置 `socks5-node` 快捷管理命令。如果已安装节点，再次运行无参数安装命令只会恢复并显示现有服务。若需使用新参数更换端口或凭据，可直接添加 `-f / --force` 参数覆盖重装，或先卸载后再安装。
 
 ## 管理
 
-### 通用 Linux (systemd)
+安装后可在系统任意目录下直接执行 `socks5-node` 命令进行管理：
+
+### 本地快捷管理
 
 查看节点信息：
 
 ```bash
-sudo bash socks5.sh info
+socks5-node info
 ```
 
-查看状态和日志：
+卸载节点：
 
 ```bash
-systemctl status socks5-node --no-pager
-journalctl -u socks5-node -f
+socks5-node uninstall
 ```
 
-卸载（交互确认）：
+自动化或免确认卸载：
 
 ```bash
-sudo bash socks5.sh uninstall
+socks5-node uninstall --yes
 ```
 
-自动化环境中显式确认卸载：
+### 服务与日志查看
 
-```bash
-sudo bash socks5.sh uninstall --yes
-```
+- **通用 Linux (systemd)**：
+  ```bash
+  systemctl status socks5-node --no-pager
+  journalctl -u socks5-node -f
+  ```
+- **Alpine Linux (OpenRC)**：
+  ```bash
+  rc-service socks5-node status
+  tail -f /var/log/socks5-node.log
+  ```
 
-### Alpine Linux (OpenRC)
+### 远程一键卸载（无需本地保存脚本）
 
-查看节点信息：
-
-```bash
-bash socks5_alpine.sh info
-```
-
-查看状态和日志：
-
-```bash
-rc-service socks5-node status
-tail -f /var/log/socks5-node.log
-```
-
-卸载（交互确认）：
-
-```bash
-bash socks5_alpine.sh uninstall
-```
-
-自动化环境中显式确认卸载：
-
-```bash
-bash socks5_alpine.sh uninstall --yes
-```
+- **通用 Linux**：
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/yayitinyu/socks/main/socks5.sh | sudo bash -s -- uninstall --yes
+  ```
+- **Alpine Linux**：
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/yayitinyu/socks/main/socks5_alpine.sh | bash -s -- uninstall --yes
+  ```
 
 卸载会删除本脚本创建的服务、防火墙规则、凭据和托管账号，但会保留发行版安装的 Dante 软件包，避免误删其他程序的依赖。
 

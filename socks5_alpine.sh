@@ -37,6 +37,7 @@ LOG_FILE="/var/log/${APP_NAME}.log"
 ACTION="install"
 ASSUME_YES=0
 CONFIG_OVERRIDES=0
+CLI_FORCE=0
 CLI_PORT=""
 CLI_USERNAME=""
 CLI_PASSWORD=""
@@ -44,6 +45,7 @@ CLI_ALLOW_CIDR=""
 CLI_ALLOW_PRIVATE=0
 CLI_DISABLE_FIREWALL=0
 CLI_HOST=""
+REMOTE_SCRIPT_URL="https://raw.githubusercontent.com/yayitinyu/socks/main/socks5_alpine.sh"
 
 SOCKS_PORT=""
 SOCKS_USERNAME=""
@@ -129,6 +131,7 @@ Alpine Linux SOCKS5 一键安装脚本 (OpenRC)
       --allow-cidr CIDR    只允许指定 IPv4/CIDR 连接；默认 0.0.0.0/0
       --allow-private      允许代理访问内网、环回及链路本地地址
       --no-firewall        不修改 VPS 操作系统防火墙
+  -f, --force, --reinstall 覆盖已有的旧节点安装
   -y, --yes                跳过卸载确认
   -h, --help               显示帮助
       --version            显示版本
@@ -205,7 +208,7 @@ rollback_install() {
         "$FIREWALL_HELPER" remove >/dev/null 2>&1
     fi
 
-    rm -f -- "$SERVICE_INIT" "$FIREWALL_INIT" "$FIREWALL_HELPER" "$DANTE_CONFIG_FILE" "$LOG_FILE"
+    rm -f -- "$SERVICE_INIT" "$FIREWALL_INIT" "$FIREWALL_HELPER" "$DANTE_CONFIG_FILE" "$LOG_FILE" "/usr/local/bin/${APP_NAME}"
 
     if ((AUTH_USER_CREATED == 1)) && id "$SOCKS_USERNAME" >/dev/null 2>&1; then
         remove_managed_user "$SOCKS_USERNAME" "$AUTH_USER_UID"
@@ -304,6 +307,10 @@ parse_args() {
             --no-firewall)
                 CLI_DISABLE_FIREWALL=1
                 CONFIG_OVERRIDES=1
+                shift
+                ;;
+            -f | --force | --reinstall)
+                CLI_FORCE=1
                 shift
                 ;;
             -y | --yes)
@@ -1320,8 +1327,8 @@ print_runtime_status() {
     printf '\n'
     printf '服务管理：rc-service %s {status|restart|stop}\n' "$APP_NAME"
     printf '查看日志：tail -f %s\n' "$LOG_FILE"
-    printf '查看信息：bash socks5_alpine.sh info\n'
-    printf '卸载节点：bash socks5_alpine.sh uninstall\n'
+    printf '查看信息：socks5-node info\n'
+    printf '卸载节点：socks5-node uninstall\n'
     printf '\n'
     log_warn "标准 SOCKS5 用户名/密码不会加密传输；不要在不可信网络中传递敏感明文数据。"
     log_warn "云厂商安全组不属于 VPS 系统防火墙，如仍无法连接，请手动放行 TCP ${SOCKS_PORT}。"
@@ -1390,13 +1397,31 @@ preflight_new_install() {
     [[ -z "$conflict" ]] || die "发现不受状态文件管理的残留路径：${conflict}。请先人工检查，脚本不会覆盖。"
 }
 
+install_cli_helper() {
+    local target="/usr/local/bin/${APP_NAME}"
+    mkdir -p /usr/local/bin
+    if [[ -f "$0" && "$0" != "bash" && "$0" != "/bin/bash" && "$0" != "/usr/bin/bash" && "$0" != "sh" && "$0" != "/bin/sh" ]]; then
+        cp -f "$0" "$target" 2>/dev/null && chmod 755 "$target" || true
+    elif command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$REMOTE_SCRIPT_URL" -o "$target" 2>/dev/null && chmod 755 "$target" || true
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$target" "$REMOTE_SCRIPT_URL" 2>/dev/null && chmod 755 "$target" || true
+    fi
+}
+
 install_action() {
     if [[ -f "$STATE_FILE" ]]; then
-        ((CONFIG_OVERRIDES == 0)) || die "节点已安装。为避免误删账号或旧防火墙规则，请先卸载后再用新参数安装。"
-        load_state
-        log_info "检测到已有安装，正在校验并恢复服务。"
-        ensure_existing_install_running
-        return
+        if ((CLI_FORCE == 1)); then
+            log_info "检测到已有安装且指定了 --force，正在执行覆盖重装..."
+            ASSUME_YES=1 uninstall_action
+        elif ((CONFIG_OVERRIDES == 0)); then
+            load_state
+            log_info "检测到已有安装，正在校验并恢复服务。"
+            ensure_existing_install_running
+            return
+        else
+            die "节点已安装。如需使用新参数重新安装，请添加 --force（覆盖重装），或先执行卸载：socks5-node uninstall"
+        fi
     fi
 
     preflight_new_install
@@ -1496,6 +1521,7 @@ install_action() {
 
     INSTALLED_AT=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
     atomic_write "$STATE_FILE" 600 render_state
+    install_cli_helper
     ROLLBACK_ACTIVE=0
 
     log_success "SOCKS5 节点安装完成。"
@@ -1590,7 +1616,7 @@ uninstall_action() {
     fi
     ((cleanup_failed == 0)) || die "卸载已暂停，状态文件与辅助脚本仍保留；修复上述问题后可重试。"
 
-    rm -f -- "$SERVICE_INIT" "$FIREWALL_INIT" "$FIREWALL_HELPER" "$DANTE_CONFIG_FILE" "$LOG_FILE"
+    rm -f -- "$SERVICE_INIT" "$FIREWALL_INIT" "$FIREWALL_HELPER" "$DANTE_CONFIG_FILE" "$LOG_FILE" "/usr/local/bin/${APP_NAME}"
 
     remove_managed_user "$SOCKS_USERNAME" "$AUTH_USER_UID"
     remove_managed_user "$DAEMON_USER" "$DAEMON_USER_UID"

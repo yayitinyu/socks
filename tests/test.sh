@@ -595,6 +595,24 @@ pass "Alpine parse_args handles PUBLIC_HOST environment variable"
 ) || fail "Alpine state round-trip preserves PUBLIC_HOST"
 pass "Alpine state round-trip preserves PUBLIC_HOST"
 
+(
+    export SOCKS5_NODE_LIB_ONLY=1
+    # shellcheck disable=SC1090
+    source "$SCRIPT_PATH"
+    parse_args --force
+    [[ "$CLI_FORCE" -eq 1 ]]
+) || fail "parse_args handles --force flag"
+pass "parse_args handles --force flag"
+
+(
+    export SOCKS5_NODE_LIB_ONLY=1
+    # shellcheck disable=SC1090
+    source "$ALPINESCRIPT_PATH"
+    parse_args --reinstall
+    [[ "$CLI_FORCE" -eq 1 ]]
+) || fail "Alpine parse_args handles --reinstall flag"
+pass "Alpine parse_args handles --reinstall flag"
+
 rm -f -- "$TEMP_ALPINE_SERVICE" "$TEMP_ALPINE_FIREWALL_INIT" "$TEMP_ALPINE_CONFIG" "$TEMP_ALPINE_STATE"
 
 printf '1..%d\n' "$TESTS_RUN"
