@@ -150,6 +150,13 @@ assert_false "rejects an IPv4 octet above 255" is_valid_ipv4_cidr 256.0.0.1/32
 assert_false "rejects ambiguous leading zeroes" is_valid_ipv4_cidr 010.0.0.1/32
 assert_false "rejects an oversized prefix" is_valid_ipv4_cidr 192.0.2.1/33
 
+assert_true "accepts valid IPv4 host" is_valid_host 203.0.113.8
+assert_true "accepts valid domain host" is_valid_host nat.example.com
+assert_true "accepts valid hyphenated domain" is_valid_host my-node-1.vps.net
+assert_false "rejects url scheme in host" is_valid_host https://nat.example.com
+assert_false "rejects spaces in host" is_valid_host "nat .com"
+assert_false "rejects double dots in host" is_valid_host "nat..example.com"
+
 if [[ "$(normalize_ipv4_cidr 203.0.113.9)" == "203.0.113.9/32" ]]; then
     pass "normalizes a single IPv4 address to /32"
 else
@@ -518,42 +525,79 @@ assert_contains "Alpine Dante config binds high port" "$TEMP_ALPINE_CONFIG" "int
     export SOCKS5_NODE_LIB_ONLY=1
     # shellcheck disable=SC1090
     source "$SCRIPT_PATH"
-    parse_args -p 35678
-    [[ "$CLI_PORT" == "35678" && "$CONFIG_OVERRIDES" -eq 1 ]]
-) || fail "parse_args handles CLI -p flag"
-pass "parse_args handles CLI -p flag"
+    parse_args -p 35678 -H nat.example.com
+    [[ "$CLI_PORT" == "35678" && "$CLI_HOST" == "nat.example.com" && "$CONFIG_OVERRIDES" -eq 1 ]]
+) || fail "parse_args handles CLI -H flag"
+pass "parse_args handles CLI -H flag"
 
 (
     export SOCKS5_NODE_LIB_ONLY=1
     export PORT=35679
+    export HOST=node1.domain.com
     # shellcheck disable=SC1090
     source "$SCRIPT_PATH"
     parse_args
-    [[ "$CLI_PORT" == "35679" && "$CONFIG_OVERRIDES" -eq 1 ]]
-) || fail "parse_args handles PORT environment variable"
-pass "parse_args handles PORT environment variable"
+    [[ "$CLI_PORT" == "35679" && "$CLI_HOST" == "node1.domain.com" && "$CONFIG_OVERRIDES" -eq 1 ]]
+) || fail "parse_args handles HOST environment variable"
+pass "parse_args handles HOST environment variable"
 
 (
     export SOCKS5_NODE_LIB_ONLY=1
     # shellcheck disable=SC1090
     source "$ALPINESCRIPT_PATH"
-    parse_args --port 35680
-    [[ "$CLI_PORT" == "35680" && "$CONFIG_OVERRIDES" -eq 1 ]]
-) || fail "Alpine parse_args handles CLI --port flag"
-pass "Alpine parse_args handles CLI --port flag"
+    parse_args --port 35680 --host 198.51.100.25
+    [[ "$CLI_PORT" == "35680" && "$CLI_HOST" == "198.51.100.25" && "$CONFIG_OVERRIDES" -eq 1 ]]
+) || fail "Alpine parse_args handles CLI --host flag"
+pass "Alpine parse_args handles CLI --host flag"
 
 (
     export SOCKS5_NODE_LIB_ONLY=1
     export PORT=35681
+    export PUBLIC_HOST=alpine-nat.example.org
     # shellcheck disable=SC1090
     source "$ALPINESCRIPT_PATH"
     parse_args
-    [[ "$CLI_PORT" == "35681" && "$CONFIG_OVERRIDES" -eq 1 ]]
-) || fail "Alpine parse_args handles PORT environment variable"
-pass "Alpine parse_args handles PORT environment variable"
+    [[ "$CLI_PORT" == "35681" && "$CLI_HOST" == "alpine-nat.example.org" && "$CONFIG_OVERRIDES" -eq 1 ]]
+) || fail "Alpine parse_args handles PUBLIC_HOST environment variable"
+pass "Alpine parse_args handles PUBLIC_HOST environment variable"
+
+# Test state round-trip with PUBLIC_HOST
+(
+    export SOCKS5_NODE_LIB_ONLY=1
+    # shellcheck disable=SC1090
+    source "$ALPINESCRIPT_PATH"
+    export STATE_FILE=$TEMP_ALPINE_STATE
+    export SOCKS_PORT=45678
+    export SOCKS_USERNAME=s5u_deadbeef
+    export SOCKS_PASSWORD=abcdef0123456789abcdef01
+    export PUBLIC_HOST=nat.alpine.net
+    export ALLOW_CIDR=0.0.0.0/0
+    export ALLOW_PRIVATE=0
+    export EXTERNAL_INTERFACE=eth0
+    export DANTE_BIN=/usr/sbin/sockd
+    export FIREWALL_BACKEND=none
+    export FIREWALL_ZONE=""
+    export AUTH_GROUP=s5g_deadbeef
+    export AUTH_GROUP_GID=991
+    export AUTH_USER_UID=992
+    export DAEMON_USER=s5d_deadbeef
+    export DAEMON_USER_UID=993
+    export DAEMON_GROUP=s5d_deadbeef
+    export DAEMON_GROUP_GID=994
+    export INSTALLED_AT=2026-08-10T00:00:00Z
+    export DANTE_WAS_PRESENT=0
+    export DANTE_CONFIG_DIR_CREATED=1
+    export SELINUX_ENABLED=0
+    export SELINUX_PORT_MANAGED=0
+    render_state >"$TEMP_ALPINE_STATE"
+    load_state
+    [[ "$PUBLIC_HOST" == "nat.alpine.net" ]]
+) || fail "Alpine state round-trip preserves PUBLIC_HOST"
+pass "Alpine state round-trip preserves PUBLIC_HOST"
 
 rm -f -- "$TEMP_ALPINE_SERVICE" "$TEMP_ALPINE_FIREWALL_INIT" "$TEMP_ALPINE_CONFIG" "$TEMP_ALPINE_STATE"
 
 printf '1..%d\n' "$TESTS_RUN"
+
 
 

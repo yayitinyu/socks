@@ -49,6 +49,8 @@ curl -fsSL https://raw.githubusercontent.com/yayitinyu/socks/main/socks5.sh \
 
 ### Alpine Linux（OpenRC 环境）
 
+Alpine 默认通常直接以 `root` 登录且未预装 `sudo`，直接执行即可：
+
 **1. 默认随机端口（20000-60000）一键安装：**
 
 ```bash
@@ -75,7 +77,14 @@ apk add --no-cache curl bash && curl -fsSL https://raw.githubusercontent.com/yay
   | PORT=35678 bash
 ```
 
-**3. 限制只允许指定公网 IP 连接：**
+**3. NAT VPS（NAT 小鸡）指定入口 IP / 域名与映射端口：**
+
+```bash
+apk add --no-cache curl bash && curl -fsSL https://raw.githubusercontent.com/yayitinyu/socks/main/socks5_alpine.sh \
+  | bash -s -- --port 35678 --host nat.example.com
+```
+
+**4. 限制只允许指定客户端公网 IP 连接：**
 
 ```bash
 apk add --no-cache curl bash && curl -fsSL https://raw.githubusercontent.com/yayitinyu/socks/main/socks5_alpine.sh \
@@ -91,6 +100,7 @@ apk add --no-cache curl bash && curl -fsSL https://raw.githubusercontent.com/yay
 ```bash
 sudo bash socks5.sh install \
   --port 35678 \
+  --host nat.example.com \
   --username myproxy \
   --password 'ReplaceWithStrongPassword123' \
   --allow-cidr 203.0.113.8/32
@@ -99,8 +109,9 @@ sudo bash socks5.sh install \
 Alpine Linux：
 
 ```bash
-sudo bash socks5_alpine.sh install \
+bash socks5_alpine.sh install \
   --port 35678 \
+  --host nat.example.com \
   --username myproxy \
   --password 'ReplaceWithStrongPassword123' \
   --allow-cidr 203.0.113.8/32
@@ -110,9 +121,10 @@ sudo bash socks5_alpine.sh install \
 
 | 参数 | 说明 |
 | --- | --- |
-| `--port PORT` | 指定 `1025-65535` 范围内的端口 |
-| `--username USER` | 指定新建的 SOCKS5 系统用户名 |
-| `--password PASS` | 指定 12-128 位安全字符密码 |
+| `-p, --port PORT` | 指定 `1025-65535` 范围内的端口 |
+| `-H, --host HOST` | 指定客户端连接入口地址（IPv4 或域名，用于 NAT 小鸡等场景） |
+| `-u, --username USER` | 指定新建的 SOCKS5 系统用户名 |
+| `-P, --password PASS` | 指定 12-128 位安全字符密码 |
 | `--allow-cidr CIDR` | 只允许一个 IPv4 地址或网段连接 |
 | `--allow-private` | 允许代理访问 VPS 所在的私网和链路本地地址 |
 | `--no-firewall` | 完全不修改操作系统防火墙 |
@@ -153,7 +165,7 @@ sudo bash socks5.sh uninstall --yes
 查看节点信息：
 
 ```bash
-sudo bash socks5_alpine.sh info
+bash socks5_alpine.sh info
 ```
 
 查看状态和日志：
@@ -166,13 +178,13 @@ tail -f /var/log/socks5-node.log
 卸载（交互确认）：
 
 ```bash
-sudo bash socks5_alpine.sh uninstall
+bash socks5_alpine.sh uninstall
 ```
 
 自动化环境中显式确认卸载：
 
 ```bash
-sudo bash socks5_alpine.sh uninstall --yes
+bash socks5_alpine.sh uninstall --yes
 ```
 
 卸载会删除本脚本创建的服务、防火墙规则、凭据和托管账号，但会保留发行版安装的 Dante 软件包，避免误删其他程序的依赖。

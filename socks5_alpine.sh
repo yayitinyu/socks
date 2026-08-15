@@ -43,10 +43,12 @@ CLI_PASSWORD=""
 CLI_ALLOW_CIDR=""
 CLI_ALLOW_PRIVATE=0
 CLI_DISABLE_FIREWALL=0
+CLI_HOST=""
 
 SOCKS_PORT=""
 SOCKS_USERNAME=""
 SOCKS_PASSWORD=""
+PUBLIC_HOST="${PUBLIC_HOST:-}"
 ALLOW_CIDR="0.0.0.0/0"
 ALLOW_PRIVATE=0
 EXTERNAL_INTERFACE=""
@@ -115,12 +117,13 @@ usage() {
 Alpine Linux SOCKS5 一键安装脚本 (OpenRC)
 
 用法：
-  sudo bash socks5_alpine.sh [install] [选项]
-  sudo bash socks5_alpine.sh info
-  sudo bash socks5_alpine.sh uninstall [--yes]
+  bash socks5_alpine.sh [install] [选项]
+  bash socks5_alpine.sh info
+  bash socks5_alpine.sh uninstall [--yes]
 
 安装选项：
   -p, --port PORT          指定监听端口；默认在 20000-60000 中随机选择
+  -H, --host HOST          指定连接入口地址（IPv4 或域名，用于 NAT VPS）
   -u, --username USER      指定认证用户名；默认随机生成
   -P, --password PASS      指定认证密码；默认随机生成
       --allow-cidr CIDR    只允许指定 IPv4/CIDR 连接；默认 0.0.0.0/0
@@ -269,6 +272,12 @@ parse_args() {
                 CONFIG_OVERRIDES=1
                 shift 2
                 ;;
+            -H | --host | --server-host | --public-host | --domain | --public-ip)
+                require_option_value "$1" "$#"
+                CLI_HOST=$2
+                CONFIG_OVERRIDES=1
+                shift 2
+                ;;
             -u | --username)
                 require_option_value "$1" "$#"
                 CLI_USERNAME=$2
@@ -317,6 +326,16 @@ parse_args() {
 
     if [[ -z "$CLI_PORT" && -n "${PORT:-}" ]]; then
         CLI_PORT="$PORT"
+        CONFIG_OVERRIDES=1
+    fi
+    if [[ -z "$CLI_HOST" && -n "${HOST:-}" ]]; then
+        CLI_HOST="$HOST"
+        CONFIG_OVERRIDES=1
+    elif [[ -z "$CLI_HOST" && -n "${PUBLIC_HOST:-}" ]]; then
+        CLI_HOST="$PUBLIC_HOST"
+        CONFIG_OVERRIDES=1
+    elif [[ -z "$CLI_HOST" && -n "${SERVER_HOST:-}" ]]; then
+        CLI_HOST="$SERVER_HOST"
         CONFIG_OVERRIDES=1
     fi
 
@@ -381,6 +400,16 @@ normalize_ipv4_cidr() {
     fi
     is_valid_ipv4_cidr "$value" || return 1
     printf '%s\n' "$value"
+}
+
+is_valid_host() {
+    local value=${1:-}
+
+    [[ -n "$value" && ${#value} -le 255 ]] || return 1
+    if is_valid_ipv4 "$value"; then
+        return 0
+    fi
+    [[ "$value" =~ ^([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9])(\.([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9]))*$ ]]
 }
 
 random_hex() {
@@ -454,7 +483,7 @@ choose_random_port() {
 
 require_root_and_openrc() {
     [[ "$(uname -s)" == "Linux" ]] || die "此脚本只能在 Linux 上运行。"
-    ((EUID == 0)) || die "请使用 root 运行，例如：sudo bash socks5_alpine.sh 或以 root 身份执行。"
+    ((EUID == 0)) || die "请使用 root 用户运行此脚本，例如：bash socks5_alpine.sh"
 
     if [[ -r /etc/os-release ]]; then
         # shellcheck disable=SC1091
@@ -486,6 +515,7 @@ load_state() {
     SOCKS_PORT=""
     SOCKS_USERNAME=""
     SOCKS_PASSWORD=""
+    PUBLIC_HOST=""
     ALLOW_CIDR=""
     ALLOW_PRIVATE=""
     EXTERNAL_INTERFACE=""
@@ -513,6 +543,9 @@ load_state() {
     is_valid_port "$SOCKS_PORT" || die "状态文件中的端口无效。"
     is_valid_username "$SOCKS_USERNAME" || die "状态文件中的用户名无效。"
     is_valid_password "$SOCKS_PASSWORD" || die "状态文件中的密码无效。"
+    if [[ -n "$PUBLIC_HOST" ]]; then
+        is_valid_host "$PUBLIC_HOST" || die "状态文件中的入口地址无效。"
+    fi
     is_valid_ipv4_cidr "$ALLOW_CIDR" || die "状态文件中的允许网段无效。"
     [[ "$ALLOW_PRIVATE" == "0" || "$ALLOW_PRIVATE" == "1" ]] || die "状态文件中的私网选项无效。"
     [[ "$EXTERNAL_INTERFACE" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || die "状态文件中的出口网卡无效。"
@@ -1141,7 +1174,7 @@ EOF
 render_state() {
     local key value
     local -a keys=(
-        STATE_VERSION SOCKS_PORT SOCKS_USERNAME SOCKS_PASSWORD ALLOW_CIDR ALLOW_PRIVATE
+        STATE_VERSION SOCKS_PORT SOCKS_USERNAME SOCKS_PASSWORD PUBLIC_HOST ALLOW_CIDR ALLOW_PRIVATE
         EXTERNAL_INTERFACE DANTE_BIN FIREWALL_BACKEND FIREWALL_ZONE AUTH_GROUP AUTH_GROUP_GID
         AUTH_USER_UID DAEMON_USER DAEMON_USER_UID DAEMON_GROUP DAEMON_GROUP_GID INSTALLED_AT
         DANTE_WAS_PRESENT DANTE_CONFIG_DIR_CREATED SELINUX_ENABLED SELINUX_PORT_MANAGED
@@ -1258,23 +1291,27 @@ verify_socks5_authentication() {
 
 print_runtime_status() {
     local service_status="未运行"
-    local public_ip dante_version_output dante_version
+    local display_host dante_version_output dante_version
 
     if service_is_active "${APP_NAME}"; then
         service_status="运行中"
     fi
-    public_ip=$(discover_public_ipv4)
+    if [[ -n "$PUBLIC_HOST" ]]; then
+        display_host=$PUBLIC_HOST
+    else
+        display_host=$(discover_public_ipv4)
+    fi
     dante_version_output=$("$DANTE_BIN" -v 2>&1 || true)
     dante_version=$(sed -n '1p' <<<"$dante_version_output")
 
     printf '\n%sSOCKS5 节点信息 (Alpine OpenRC)%s\n' "$COLOR_BOLD" "$COLOR_RESET"
     printf '  状态：       %s\n' "$service_status"
-    printf '  地址：       %s\n' "$public_ip"
+    printf '  地址：       %s\n' "$display_host"
     printf '  端口：       %s\n' "$SOCKS_PORT"
     printf '  用户名：     %s\n' "$SOCKS_USERNAME"
     printf '  密码：       %s\n' "$SOCKS_PASSWORD"
     printf '  连接串：     socks5h://%s:%s@%s:%s\n' \
-        "$SOCKS_USERNAME" "$SOCKS_PASSWORD" "$public_ip" "$SOCKS_PORT"
+        "$SOCKS_USERNAME" "$SOCKS_PASSWORD" "$display_host" "$SOCKS_PORT"
     printf '  允许来源：   %s\n' "$ALLOW_CIDR"
     printf '  防火墙：     %s%s\n' "$FIREWALL_BACKEND" "${FIREWALL_ZONE:+ (${FIREWALL_ZONE})}"
     printf '  出口网卡：   %s\n' "$EXTERNAL_INTERFACE"
@@ -1283,8 +1320,8 @@ print_runtime_status() {
     printf '\n'
     printf '服务管理：rc-service %s {status|restart|stop}\n' "$APP_NAME"
     printf '查看日志：tail -f %s\n' "$LOG_FILE"
-    printf '查看信息：sudo bash socks5_alpine.sh info\n'
-    printf '卸载节点：sudo bash socks5_alpine.sh uninstall\n'
+    printf '查看信息：bash socks5_alpine.sh info\n'
+    printf '卸载节点：bash socks5_alpine.sh uninstall\n'
     printf '\n'
     log_warn "标准 SOCKS5 用户名/密码不会加密传输；不要在不可信网络中传递敏感明文数据。"
     log_warn "云厂商安全组不属于 VPS 系统防火墙，如仍无法连接，请手动放行 TCP ${SOCKS_PORT}。"
@@ -1380,6 +1417,13 @@ install_action() {
         SOCKS_PASSWORD=$CLI_PASSWORD
     else
         SOCKS_PASSWORD=$(random_hex 24)
+    fi
+
+    if [[ -n "$CLI_HOST" ]]; then
+        is_valid_host "$CLI_HOST" || die "指定的入口地址（IP 或域名）格式无效：${CLI_HOST}"
+        PUBLIC_HOST=$CLI_HOST
+    else
+        PUBLIC_HOST=""
     fi
 
     if [[ -n "$CLI_ALLOW_CIDR" ]]; then
