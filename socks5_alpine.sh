@@ -560,6 +560,21 @@ wait_for_port_listen() {
     return 1
 }
 
+wait_for_port_free() {
+    local port=$1
+    local timeout_seconds=${2:-5}
+    local deadline
+
+    deadline=$(($(date +%s) + timeout_seconds))
+    while (( $(date +%s) <= deadline )); do
+        if ! port_in_use "$port"; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    ! port_in_use "$port"
+}
+
 choose_random_port() {
     local attempt random_value candidate
 
@@ -1693,6 +1708,7 @@ install_action() {
     if [[ -n "$CLI_PORT" ]]; then
         is_valid_port "$CLI_PORT" || die "端口必须是 1025-65535 之间的整数。"
         SOCKS_PORT=$((10#$CLI_PORT))
+        wait_for_port_free "$SOCKS_PORT" 3 || true
     else
         SOCKS_PORT=$(choose_random_port) || die "无法找到空闲高位端口。"
     fi
@@ -1870,6 +1886,19 @@ uninstall_action() {
     service_stop "${APP_NAME}-firewall"
     service_disable "${APP_NAME}"
     service_disable "${APP_NAME}-firewall"
+    if [[ -n "${SOCKS_PORT:-}" ]]; then
+        wait_for_port_free "$SOCKS_PORT" 5 || true
+    fi
+    if [[ -f "/run/${APP_NAME}/sockd.pid" ]]; then
+        local pid
+        pid=$(cat "/run/${APP_NAME}/sockd.pid" 2>/dev/null || true)
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+            if [[ -n "${SOCKS_PORT:-}" ]]; then
+                wait_for_port_free "$SOCKS_PORT" 3 || true
+            fi
+        fi
+    fi
 
     if [[ -x "$FIREWALL_HELPER" ]]; then
         if ! "$FIREWALL_HELPER" remove; then
