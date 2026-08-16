@@ -150,17 +150,49 @@ assert_false "rejects an IPv4 octet above 255" is_valid_ipv4_cidr 256.0.0.1/32
 assert_false "rejects ambiguous leading zeroes" is_valid_ipv4_cidr 010.0.0.1/32
 assert_false "rejects an oversized prefix" is_valid_ipv4_cidr 192.0.2.1/33
 
+assert_true "accepts an IPv6 loopback address" is_valid_ipv6 ::1
+assert_true "accepts an IPv6 unspecified address" is_valid_ipv6 ::
+assert_true "accepts a global unicast IPv6 address" is_valid_ipv6 2001:db8::1
+assert_true "accepts a full 8-block IPv6 address" is_valid_ipv6 2001:0db8:85a3:0000:0000:8a2e:0370:7334
+assert_false "rejects triple colon in IPv6" is_valid_ipv6 2001:db8:::1
+assert_false "rejects multiple double colons in IPv6" is_valid_ipv6 2001:db8::1::2
+assert_false "rejects non-hex characters in IPv6" is_valid_ipv6 2001:xyz::1
+assert_false "rejects block larger than 4 hex digits" is_valid_ipv6 2001:12345::1
+
+assert_true "accepts an IPv6 CIDR" is_valid_ipv6_cidr 2001:db8::/32
+assert_true "accepts an IPv6 host CIDR" is_valid_ipv6_cidr 2001:db8::1/128
+assert_true "accepts the all-IPv6 CIDR" is_valid_ipv6_cidr ::/0
+assert_false "rejects an oversized IPv6 prefix" is_valid_ipv6_cidr 2001:db8::/129
+
+assert_true "accepts 0/0 CIDR wildcard" is_valid_cidr 0/0
+assert_true "accepts IPv4 CIDR in is_valid_cidr" is_valid_cidr 192.0.2.0/24
+assert_true "accepts IPv6 CIDR in is_valid_cidr" is_valid_cidr 2001:db8::/48
+
 assert_true "accepts valid IPv4 host" is_valid_host 203.0.113.8
+assert_true "accepts valid IPv6 host" is_valid_host 2001:db8::1
+assert_true "accepts valid bracketed IPv6 host" is_valid_host "[2001:db8::1]"
 assert_true "accepts valid domain host" is_valid_host nat.example.com
 assert_true "accepts valid hyphenated domain" is_valid_host my-node-1.vps.net
 assert_false "rejects url scheme in host" is_valid_host https://nat.example.com
 assert_false "rejects spaces in host" is_valid_host "nat .com"
 assert_false "rejects double dots in host" is_valid_host "nat..example.com"
 
-if [[ "$(normalize_ipv4_cidr 203.0.113.9)" == "203.0.113.9/32" ]]; then
+if [[ "$(normalize_cidr 203.0.113.9)" == "203.0.113.9/32" ]]; then
     pass "normalizes a single IPv4 address to /32"
 else
     fail "normalizes a single IPv4 address to /32"
+fi
+
+if [[ "$(normalize_cidr 2001:db8::1)" == "2001:db8::1/128" ]]; then
+    pass "normalizes a single IPv6 address to /128"
+else
+    fail "normalizes a single IPv6 address to /128"
+fi
+
+if [[ "$(normalize_cidr 0/0)" == "0/0" ]]; then
+    pass "normalizes 0/0 CIDR wildcard"
+else
+    fail "normalizes 0/0 CIDR wildcard"
 fi
 
 for _ in {1..32}; do
@@ -186,8 +218,11 @@ assert_contains "drops privileges with the Dante 1.4.x directive" "$TEMP_CONFIG"
 assert_not_contains "does not emit the obsolete privilege directive" "$TEMP_CONFIG" "user.notprivileged:"
 assert_contains "requires username authentication" "$TEMP_CONFIG" "socksmethod: username"
 assert_contains "limits authenticated access to the managed group" "$TEMP_CONFIG" "group: s5g_deadbeef"
-assert_contains "limits client source addresses" "$TEMP_CONFIG" "from: 203.0.113.8/32 to: 0.0.0.0/0"
+assert_contains "limits client source addresses" "$TEMP_CONFIG" "from: 203.0.113.8/32 to: 0/0"
 assert_contains "blocks cloud metadata and link-local targets" "$TEMP_CONFIG" "to: 169.254.0.0/16"
+assert_contains "blocks IPv6 loopback targets" "$TEMP_CONFIG" "to: ::1/128"
+assert_contains "blocks IPv6 private ULA targets" "$TEMP_CONFIG" "to: fc00::/7"
+assert_contains "blocks IPv6 link-local targets" "$TEMP_CONFIG" "to: fe80::/10"
 assert_contains "allows TCP CONNECT" "$TEMP_CONFIG" "command: connect"
 assert_not_contains "does not enable UDP Associate" "$TEMP_CONFIG" "udpassociate"
 
@@ -519,6 +554,8 @@ assert_contains "Alpine firewall init calls helper remove" "$TEMP_ALPINE_FIREWAL
 
 assert_contains "Alpine Dante config logs to file" "$TEMP_ALPINE_CONFIG" "logoutput: syslog /var/log/socks5-node.log"
 assert_contains "Alpine Dante config binds high port" "$TEMP_ALPINE_CONFIG" "internal: 0.0.0.0 port = 45678"
+assert_contains "Alpine Dante config allows dual-stack egress" "$TEMP_ALPINE_CONFIG" "from: 203.0.113.8/32 to: 0/0"
+assert_contains "Alpine Dante config blocks IPv6 loopback" "$TEMP_ALPINE_CONFIG" "to: ::1/128"
 
 # Test CLI args and environment port parsing
 (

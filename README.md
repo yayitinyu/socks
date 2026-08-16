@@ -4,14 +4,15 @@
 
 ## 功能
 
+- 原生支持 **IPv4 + IPv6 双栈** 出口转发与入站监听
 - 默认从 `20000-60000` 随机选择未监听的 TCP 端口
 - 随机生成独立的 SOCKS5 用户名与密码
 - 支持 Debian、Ubuntu、RHEL、Rocky Linux、AlmaLinux、CentOS Stream 和 Fedora 的常见 systemd 环境
-- 自动适配已启用的 UFW、firewalld、iptables 或 nftables
+- 自动适配已启用的 UFW、firewalld、iptables/ip6tables 或 nftables
 - 在启用 SELinux 的系统上自动管理 `socks_port_t` 端口标签和文件上下文
 - 不会自动启用原本关闭的防火墙，避免意外中断 SSH
-- 默认阻止访问环回、内网、链路本地、云元数据和保留地址
-- 配置校验、服务监听检查、正误密码握手检查与真实 SOCKS5 出口自检
+- 默认阻止访问 IPv4 与 IPv6 的环回、内网、链路本地、云元数据和保留地址
+- 配置校验、服务监听检查、正误密码握手检查与真实 SOCKS5 双栈出口自检
 - 支持安全查看安装信息和完整卸载
 
 脚本默认只开放 SOCKS5 的 TCP `CONNECT` 命令，适用于浏览器、下载工具和大多数应用代理场景，不提供 UDP Associate。
@@ -122,10 +123,10 @@ bash socks5_alpine.sh install \
 | 参数 | 说明 |
 | --- | --- |
 | `-p, --port PORT` | 指定 `1025-65535` 范围内的端口 |
-| `-H, --host HOST` | 指定客户端连接入口地址（IPv4 或域名，用于 NAT 小鸡等场景） |
+| `-H, --host HOST` | 指定客户端连接入口地址（IPv4 / IPv6 或域名，用于 NAT 小鸡等场景） |
 | `-u, --username USER` | 指定新建的 SOCKS5 系统用户名 |
 | `-P, --password PASS` | 指定 12-128 位安全字符密码 |
-| `--allow-cidr CIDR` | 只允许一个 IPv4 地址或网段连接 |
+| `--allow-cidr CIDR` | 只允许一个 IPv4 或 IPv6 地址/网段连接；默认 `0/0`（放行全部来源） |
 | `--allow-private` | 允许代理访问 VPS 所在的私网和链路本地地址 |
 | `--no-firewall` | 完全不修改操作系统防火墙 |
 | `-f, --force` | 覆盖已有的旧节点安装并应用新参数 |
@@ -186,9 +187,9 @@ socks5-node uninstall --yes
 
 脚本只管理 VPS 操作系统内部的防火墙：
 
-- UFW：添加带 `socks5-node-端口` 注释的 IPv4 TCP 规则
-- firewalld：在出口网卡所属 zone 添加来源受限的 rich rule
-- iptables/nftables：添加带唯一注释的规则，并通过系统服务在重启后恢复
+- UFW：添加带 `socks5-node-端口` 注释的 TCP 规则（自动处理 IPv4/IPv6）
+- firewalld：在出口网卡所属 zone 放行端口或来源受限的 rich rule（支持 IPv4 / IPv6）
+- iptables/ip6tables/nftables：添加带唯一注释的规则，并通过系统服务在重启后恢复
 - 未检测到活动防火墙：不做修改，因为此时系统本身没有阻止该端口
 
 启用 SELinux 时（如 RHEL/Fedora），脚本不会关闭或切换到 Permissive 模式，而是为随机端口添加精确的 `socks_port_t` 本地映射；卸载时只删除本脚本创建的映射。若目标端口已有其他本地 SELinux 映射，脚本会换一个随机端口或拒绝覆盖用户指定端口。

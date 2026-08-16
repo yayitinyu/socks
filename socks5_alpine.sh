@@ -51,7 +51,7 @@ SOCKS_PORT=""
 SOCKS_USERNAME=""
 SOCKS_PASSWORD=""
 PUBLIC_HOST="${PUBLIC_HOST:-}"
-ALLOW_CIDR="0.0.0.0/0"
+ALLOW_CIDR="0/0"
 ALLOW_PRIVATE=0
 EXTERNAL_INTERFACE=""
 DANTE_BIN=""
@@ -125,10 +125,10 @@ Alpine Linux SOCKS5 一键安装脚本 (OpenRC)
 
 安装选项：
   -p, --port PORT          指定监听端口；默认在 20000-60000 中随机选择
-  -H, --host HOST          指定连接入口地址（IPv4 或域名，用于 NAT VPS）
+  -H, --host HOST          指定连接入口地址（IPv4 / IPv6 或域名，用于 NAT VPS）
   -u, --username USER      指定认证用户名；默认随机生成
   -P, --password PASS      指定认证密码；默认随机生成
-      --allow-cidr CIDR    只允许指定 IPv4/CIDR 连接；默认 0.0.0.0/0
+      --allow-cidr CIDR    只允许指定 IPv4 / IPv6 地址或网段连接；默认 0/0 放行全部
       --allow-private      允许代理访问内网、环回及链路本地地址
       --no-firewall        不修改 VPS 操作系统防火墙
   -f, --force, --reinstall 覆盖已有的旧节点安装
@@ -385,6 +385,44 @@ is_valid_ipv4() {
     done
 }
 
+is_valid_ipv6() {
+    local address=${1:-}
+    local left right
+    local -a blocks=() block
+
+    [[ -n "$address" ]] || return 1
+    [[ "$address" =~ ^[0-9a-fA-F:]+$ ]] || return 1
+    [[ "$address" != *:::* ]] || return 1
+
+    if [[ "$address" == *::* ]]; then
+        left=${address%%::*}
+        right=${address#*::}
+        [[ "$right" != *::* ]] || return 1
+
+        local -a left_blocks=() right_blocks=()
+        if [[ -n "$left" ]]; then
+            IFS=':' read -r -a left_blocks <<<"$left"
+        fi
+        if [[ -n "$right" ]]; then
+            IFS=':' read -r -a right_blocks <<<"$right"
+        fi
+        local total_blocks=$((${#left_blocks[@]} + ${#right_blocks[@]}))
+        ((total_blocks <= 7)) || return 1
+
+        for block in "${left_blocks[@]}" "${right_blocks[@]}"; do
+            [[ "$block" =~ ^[0-9a-fA-F]{1,4}$ ]] || return 1
+        done
+        return 0
+    else
+        IFS=':' read -r -a blocks <<<"$address"
+        ((${#blocks[@]} == 8)) || return 1
+        for block in "${blocks[@]}"; do
+            [[ "$block" =~ ^[0-9a-fA-F]{1,4}$ ]] || return 1
+        done
+        return 0
+    fi
+}
+
 is_valid_ipv4_cidr() {
     local value=${1:-}
     local address prefix
@@ -399,6 +437,29 @@ is_valid_ipv4_cidr() {
     ((10#$prefix <= 32))
 }
 
+is_valid_ipv6_cidr() {
+    local value=${1:-}
+    local address prefix
+
+    [[ "$value" == */* ]] || return 1
+    address=${value%/*}
+    prefix=${value#*/}
+
+    is_valid_ipv6 "$address" || return 1
+    [[ "$prefix" =~ ^[0-9]{1,3}$ ]] || return 1
+    [[ "$prefix" == "0" || "$prefix" != 0* ]] || return 1
+    ((10#$prefix <= 128))
+}
+
+is_valid_cidr() {
+    local value=${1:-}
+
+    [[ "$value" == "0/0" ]] && return 0
+    is_valid_ipv4_cidr "$value" && return 0
+    is_valid_ipv6_cidr "$value" && return 0
+    return 1
+}
+
 normalize_ipv4_cidr() {
     local value=$1
 
@@ -409,11 +470,37 @@ normalize_ipv4_cidr() {
     printf '%s\n' "$value"
 }
 
+normalize_cidr() {
+    local value=$1
+
+    if [[ "$value" == "0/0" || "$value" == "0.0.0.0/0" || "$value" == "::/0" ]]; then
+        printf '%s\n' "$value"
+        return 0
+    fi
+    if [[ "$value" != */* ]]; then
+        if is_valid_ipv4 "$value"; then
+            value="${value}/32"
+        elif is_valid_ipv6 "$value"; then
+            value="${value}/128"
+        else
+            return 1
+        fi
+    fi
+    if is_valid_ipv4_cidr "$value" || is_valid_ipv6_cidr "$value"; then
+        printf '%s\n' "$value"
+        return 0
+    fi
+    return 1
+}
+
 is_valid_host() {
     local value=${1:-}
 
     [[ -n "$value" && ${#value} -le 255 ]] || return 1
-    if is_valid_ipv4 "$value"; then
+    if [[ "$value" =~ ^\[([0-9a-fA-F:]+)\]$ ]]; then
+        is_valid_ipv6 "${BASH_REMATCH[1]}" && return 0
+    fi
+    if is_valid_ipv4 "$value" || is_valid_ipv6 "$value"; then
         return 0
     fi
     [[ "$value" =~ ^([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9])(\.([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9]))*$ ]]
@@ -553,7 +640,7 @@ load_state() {
     if [[ -n "$PUBLIC_HOST" ]]; then
         is_valid_host "$PUBLIC_HOST" || die "状态文件中的入口地址无效。"
     fi
-    is_valid_ipv4_cidr "$ALLOW_CIDR" || die "状态文件中的允许网段无效。"
+    is_valid_cidr "$ALLOW_CIDR" || die "状态文件中的允许网段无效。"
     [[ "$ALLOW_PRIVATE" == "0" || "$ALLOW_PRIVATE" == "1" ]] || die "状态文件中的私网选项无效。"
     [[ "$EXTERNAL_INTERFACE" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || die "状态文件中的出口网卡无效。"
     [[ "$DANTE_BIN" =~ ^/[A-Za-z0-9_./-]+$ ]] || die "状态文件中的 Dante 路径无效。"
@@ -655,6 +742,13 @@ install_dependencies() {
     fi
 }
 
+has_ipv6_stack() {
+    [[ -f /proc/net/if_inet6 ]] && return 0
+    [[ -d /proc/sys/net/ipv6 ]] && return 0
+    command -v ip >/dev/null 2>&1 && ip -6 addr show >/dev/null 2>&1 && return 0
+    return 1
+}
+
 detect_external_interface() {
     local route_output interface
 
@@ -683,7 +777,20 @@ detect_external_interface() {
         ')
     fi
 
-    [[ "$interface" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || die "无法确定安全的 IPv4 出口网卡。"
+    if [[ -z "$interface" ]]; then
+        interface=$(ip -6 route show default 2>/dev/null | awk '
+            {
+                for (i = 1; i <= NF; i++) {
+                    if ($i == "dev" && (i + 1) <= NF) {
+                        print $(i + 1)
+                        exit
+                    }
+                }
+            }
+        ')
+    fi
+
+    [[ "$interface" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || die "无法确定安全的出口网卡。"
     printf '%s\n' "$interface"
 }
 
@@ -775,6 +882,18 @@ render_dante_config() {
         "198.18.0.0/15"
         "224.0.0.0/4"
         "240.0.0.0/4"
+        "::/128"
+        "::1/128"
+        "::ffff:0:0/96"
+        "64:ff9b::/96"
+        "100::/64"
+        "2001:2::/48"
+        "2001:db8::/32"
+        "2001:10::/28"
+        "2002::/16"
+        "fc00::/7"
+        "fe80::/10"
+        "ff00::/8"
     )
 
     cat <<EOF
@@ -782,6 +901,15 @@ render_dante_config() {
 logoutput: syslog ${LOG_FILE}
 
 internal: 0.0.0.0 port = ${SOCKS_PORT}
+EOF
+
+    if has_ipv6_stack; then
+        cat <<EOF
+internal: :: port = ${SOCKS_PORT}
+EOF
+    fi
+
+    cat <<EOF
 external: ${EXTERNAL_INTERFACE}
 
 user.privileged: root
@@ -791,7 +919,7 @@ clientmethod: none
 socksmethod: username
 
 client pass {
-    from: ${ALLOW_CIDR} to: 0.0.0.0/0
+    from: ${ALLOW_CIDR} to: 0/0
     log: connect disconnect error
 }
 EOF
@@ -801,7 +929,7 @@ EOF
             cat <<EOF
 
 socks block {
-    from: 0.0.0.0/0 to: ${blocked_network}
+    from: 0/0 to: ${blocked_network}
     command: connect
     log: connect error
 }
@@ -812,7 +940,7 @@ EOF
     cat <<EOF
 
 socks pass {
-    from: ${ALLOW_CIDR} to: 0.0.0.0/0
+    from: ${ALLOW_CIDR} to: 0/0
     command: connect
     socksmethod: username
     group: ${AUTH_GROUP}
@@ -868,7 +996,7 @@ nft_input_chains() {
             in_chain = 1
         }
         in_chain && /type[[:space:]]+filter[[:space:]]+hook[[:space:]]+input([[:space:];]|$)/ {
-            if ((family == "ip" || family == "inet") && table_name != "" && chain_name != "") {
+            if ((family == "ip" || family == "ip6" || family == "inet") && table_name != "" && chain_name != "") {
                 print family " " table_name " " chain_name
             }
         }
@@ -954,6 +1082,14 @@ EOF
 
     cat <<'EOF'
 
+is_ipv6_cidr() {
+    [[ "$1" == *:* ]]
+}
+
+is_any_cidr() {
+    [[ "$1" == "0/0" || "$1" == "0.0.0.0/0" || "$1" == "::/0" ]]
+}
+
 nft_input_chains() {
     nft -a list ruleset 2>/dev/null | awk '
         $1 == "table" && NF >= 3 {
@@ -967,7 +1103,7 @@ nft_input_chains() {
             in_chain = 1
         }
         in_chain && /type[[:space:]]+filter[[:space:]]+hook[[:space:]]+input([[:space:];]|$)/ {
-            if ((family == "ip" || family == "inet") && table_name != "" && chain_name != "") {
+            if ((family == "ip" || family == "ip6" || family == "inet") && table_name != "" && chain_name != "") {
                 print family " " table_name " " chain_name
             }
         }
@@ -986,7 +1122,11 @@ ufw_add() {
     if [[ "$status_output" == *"$COMMENT"* ]]; then
         return
     fi
-    ufw allow proto tcp from "$ALLOW_CIDR" to any port "$PORT" comment "$COMMENT"
+    if is_any_cidr "$ALLOW_CIDR"; then
+        ufw allow proto tcp to any port "$PORT" comment "$COMMENT"
+    else
+        ufw allow proto tcp from "$ALLOW_CIDR" to any port "$PORT" comment "$COMMENT"
+    fi
 }
 
 ufw_remove() {
@@ -1010,62 +1150,121 @@ ufw_remove() {
             ufw --force delete "$number" >/dev/null
         done
     else
-        ufw --force delete allow proto tcp from "$ALLOW_CIDR" to any port "$PORT" >/dev/null 2>&1 || true
+        if is_any_cidr "$ALLOW_CIDR"; then
+            ufw --force delete allow proto tcp to any port "$PORT" >/dev/null 2>&1 || true
+        else
+            ufw --force delete allow proto tcp from "$ALLOW_CIDR" to any port "$PORT" >/dev/null 2>&1 || true
+        fi
     fi
 
     added_output=$(LC_ALL=C ufw show added 2>/dev/null || true)
     [[ "$added_output" != *"$COMMENT"* ]]
 }
 
-firewalld_rule() {
-    printf 'rule family="ipv4" source address="%s" port port="%s" protocol="tcp" accept' \
-        "$ALLOW_CIDR" "$PORT"
-}
-
 firewalld_add() {
-    local rule
-
     firewall-cmd --state >/dev/null 2>&1 || return 1
-    rule=$(firewalld_rule)
-    if ! firewall-cmd --permanent --zone="$ZONE" --query-rich-rule="$rule" >/dev/null; then
-        firewall-cmd --permanent --zone="$ZONE" --add-rich-rule="$rule" >/dev/null
-    fi
-    if ! firewall-cmd --zone="$ZONE" --query-rich-rule="$rule" >/dev/null; then
-        firewall-cmd --zone="$ZONE" --add-rich-rule="$rule" >/dev/null
+    if is_any_cidr "$ALLOW_CIDR"; then
+        if ! firewall-cmd --permanent --zone="$ZONE" --query-port="${PORT}/tcp" >/dev/null 2>&1; then
+            firewall-cmd --permanent --zone="$ZONE" --add-port="${PORT}/tcp" >/dev/null
+        fi
+        if ! firewall-cmd --zone="$ZONE" --query-port="${PORT}/tcp" >/dev/null 2>&1; then
+            firewall-cmd --zone="$ZONE" --add-port="${PORT}/tcp" >/dev/null
+        fi
+    else
+        local family="ipv4" rule
+        if is_ipv6_cidr "$ALLOW_CIDR"; then
+            family="ipv6"
+        fi
+        rule="rule family=\"${family}\" source address=\"${ALLOW_CIDR}\" port port=\"${PORT}\" protocol=\"tcp\" accept"
+        if ! firewall-cmd --permanent --zone="$ZONE" --query-rich-rule="$rule" >/dev/null 2>&1; then
+            firewall-cmd --permanent --zone="$ZONE" --add-rich-rule="$rule" >/dev/null
+        fi
+        if ! firewall-cmd --zone="$ZONE" --query-rich-rule="$rule" >/dev/null 2>&1; then
+            firewall-cmd --zone="$ZONE" --add-rich-rule="$rule" >/dev/null
+        fi
     fi
 }
 
 firewalld_remove() {
-    local rule
-
     firewall-cmd --state >/dev/null 2>&1 || return 1
-    rule=$(firewalld_rule)
-    if firewall-cmd --permanent --zone="$ZONE" --query-rich-rule="$rule" >/dev/null 2>&1; then
-        firewall-cmd --permanent --zone="$ZONE" --remove-rich-rule="$rule" >/dev/null
-    fi
-    if firewall-cmd --zone="$ZONE" --query-rich-rule="$rule" >/dev/null 2>&1; then
-        firewall-cmd --zone="$ZONE" --remove-rich-rule="$rule" >/dev/null
+    if is_any_cidr "$ALLOW_CIDR"; then
+        if firewall-cmd --permanent --zone="$ZONE" --query-port="${PORT}/tcp" >/dev/null 2>&1; then
+            firewall-cmd --permanent --zone="$ZONE" --remove-port="${PORT}/tcp" >/dev/null
+        fi
+        if firewall-cmd --zone="$ZONE" --query-port="${PORT}/tcp" >/dev/null 2>&1; then
+            firewall-cmd --zone="$ZONE" --remove-port="${PORT}/tcp" >/dev/null
+        fi
+    else
+        local family="ipv4" rule
+        if is_ipv6_cidr "$ALLOW_CIDR"; then
+            family="ipv6"
+        fi
+        rule="rule family=\"${family}\" source address=\"${ALLOW_CIDR}\" port port=\"${PORT}\" protocol=\"tcp\" accept"
+        if firewall-cmd --permanent --zone="$ZONE" --query-rich-rule="$rule" >/dev/null 2>&1; then
+            firewall-cmd --permanent --zone="$ZONE" --remove-rich-rule="$rule" >/dev/null
+        fi
+        if firewall-cmd --zone="$ZONE" --query-rich-rule="$rule" >/dev/null 2>&1; then
+            firewall-cmd --zone="$ZONE" --remove-rich-rule="$rule" >/dev/null
+        fi
     fi
 }
 
 iptables_add() {
-    local -a rule=(-p tcp -s "$ALLOW_CIDR" --dport "$PORT" -m comment --comment "$COMMENT" -j ACCEPT)
+    local -a rule_v4=() rule_v6=()
 
-    command -v iptables >/dev/null 2>&1 || return 1
-    iptables -w 5 -S INPUT >/dev/null 2>&1 || return 1
-    if ! iptables -w 5 -C INPUT "${rule[@]}" >/dev/null 2>&1; then
-        iptables -w 5 -I INPUT 1 "${rule[@]}"
+    if is_any_cidr "$ALLOW_CIDR"; then
+        rule_v4=(-p tcp --dport "$PORT" -m comment --comment "$COMMENT" -j ACCEPT)
+        rule_v6=(-p tcp --dport "$PORT" -m comment --comment "$COMMENT" -j ACCEPT)
+    elif is_ipv6_cidr "$ALLOW_CIDR"; then
+        rule_v6=(-p tcp -s "$ALLOW_CIDR" --dport "$PORT" -m comment --comment "$COMMENT" -j ACCEPT)
+    else
+        rule_v4=(-p tcp -s "$ALLOW_CIDR" --dport "$PORT" -m comment --comment "$COMMENT" -j ACCEPT)
+    fi
+
+    if ((${#rule_v4[@]} > 0)) && command -v iptables >/dev/null 2>&1; then
+        if iptables -w 5 -S INPUT >/dev/null 2>&1; then
+            if ! iptables -w 5 -C INPUT "${rule_v4[@]}" >/dev/null 2>&1; then
+                iptables -w 5 -I INPUT 1 "${rule_v4[@]}"
+            fi
+        fi
+    fi
+
+    if ((${#rule_v6[@]} > 0)) && command -v ip6tables >/dev/null 2>&1; then
+        if ip6tables -w 5 -S INPUT >/dev/null 2>&1; then
+            if ! ip6tables -w 5 -C INPUT "${rule_v6[@]}" >/dev/null 2>&1; then
+                ip6tables -w 5 -I INPUT 1 "${rule_v6[@]}"
+            fi
+        fi
     fi
 }
 
 iptables_remove() {
-    local -a rule=(-p tcp -s "$ALLOW_CIDR" --dport "$PORT" -m comment --comment "$COMMENT" -j ACCEPT)
+    local -a rule_v4=() rule_v6=()
 
-    command -v iptables >/dev/null 2>&1 || return 1
-    iptables -w 5 -S INPUT >/dev/null 2>&1 || return 1
-    while iptables -w 5 -C INPUT "${rule[@]}" >/dev/null 2>&1; do
-        iptables -w 5 -D INPUT "${rule[@]}"
-    done
+    if is_any_cidr "$ALLOW_CIDR"; then
+        rule_v4=(-p tcp --dport "$PORT" -m comment --comment "$COMMENT" -j ACCEPT)
+        rule_v6=(-p tcp --dport "$PORT" -m comment --comment "$COMMENT" -j ACCEPT)
+    elif is_ipv6_cidr "$ALLOW_CIDR"; then
+        rule_v6=(-p tcp -s "$ALLOW_CIDR" --dport "$PORT" -m comment --comment "$COMMENT" -j ACCEPT)
+    else
+        rule_v4=(-p tcp -s "$ALLOW_CIDR" --dport "$PORT" -m comment --comment "$COMMENT" -j ACCEPT)
+    fi
+
+    if ((${#rule_v4[@]} > 0)) && command -v iptables >/dev/null 2>&1; then
+        if iptables -w 5 -S INPUT >/dev/null 2>&1; then
+            while iptables -w 5 -C INPUT "${rule_v4[@]}" >/dev/null 2>&1; do
+                iptables -w 5 -D INPUT "${rule_v4[@]}"
+            done
+        fi
+    fi
+
+    if ((${#rule_v6[@]} > 0)) && command -v ip6tables >/dev/null 2>&1; then
+        if ip6tables -w 5 -S INPUT >/dev/null 2>&1; then
+            while ip6tables -w 5 -C INPUT "${rule_v6[@]}" >/dev/null 2>&1; do
+                ip6tables -w 5 -D INPUT "${rule_v6[@]}"
+            done
+        fi
+    fi
 }
 
 nftables_add() {
@@ -1078,8 +1277,20 @@ nftables_add() {
         IFS=' ' read -r family table_name chain_name <<<"$target"
         rules=$(nft -a list chain "$family" "$table_name" "$chain_name" 2>/dev/null || true)
         if [[ "$rules" != *"comment \"$COMMENT\""* ]]; then
-            nft insert rule "$family" "$table_name" "$chain_name" \
-                ip saddr "$ALLOW_CIDR" tcp dport "$PORT" counter accept comment "$COMMENT"
+            if is_any_cidr "$ALLOW_CIDR"; then
+                nft insert rule "$family" "$table_name" "$chain_name" \
+                    tcp dport "$PORT" counter accept comment "$COMMENT"
+            elif is_ipv6_cidr "$ALLOW_CIDR"; then
+                if [[ "$family" == "ip6" || "$family" == "inet" ]]; then
+                    nft insert rule "$family" "$table_name" "$chain_name" \
+                        ip6 saddr "$ALLOW_CIDR" tcp dport "$PORT" counter accept comment "$COMMENT"
+                fi
+            else
+                if [[ "$family" == "ip" || "$family" == "inet" ]]; then
+                    nft insert rule "$family" "$table_name" "$chain_name" \
+                        ip saddr "$ALLOW_CIDR" tcp dport "$PORT" counter accept comment "$COMMENT"
+                fi
+            fi
         fi
         found=1
     done < <(nft_input_chains)
@@ -1219,12 +1430,32 @@ discover_public_ipv4() {
     if is_valid_ipv4 "$public_ip"; then
         printf '%s\n' "$public_ip"
     else
-        printf '%s\n' "<VPS_PUBLIC_IP>"
+        printf '%s\n' "<VPS_PUBLIC_IPV4>"
+    fi
+}
+
+discover_public_ipv6() {
+    local public_ip=""
+
+    if command -v curl >/dev/null 2>&1; then
+        public_ip=$(curl --noproxy '*' -6fsS --max-time 6 https://api64.ipify.org 2>/dev/null || true)
+    fi
+    if is_valid_ipv6 "$public_ip"; then
+        printf '%s\n' "$public_ip"
+        return
+    fi
+
+    public_ip=$(ip -6 -o addr show scope global 2>/dev/null | awk 'NR == 1 { split($4, parts, "/"); print parts[1] }')
+    if is_valid_ipv6 "$public_ip"; then
+        printf '%s\n' "$public_ip"
+    else
+        printf ''
     fi
 }
 
 smoke_test_proxy() {
-    local curl_config proxy_ip
+    local curl_config proxy_ip_v4 proxy_ip_v6
+    local v4_ok=0 v6_ok=0
 
     command -v curl >/dev/null 2>&1 || return 0
     curl_config=$(mktemp /tmp/socks5-node-curl.XXXXXX)
@@ -1241,9 +1472,34 @@ fail
 max-time = 15
 EOF
 
-    proxy_ip=$(curl --config "$curl_config" 2>/dev/null || true)
-    if is_valid_ipv4 "$proxy_ip"; then
-        log_success "SOCKS5 用户名/密码与外网转发测试通过（出口 ${proxy_ip}）。"
+    proxy_ip_v4=$(curl --config "$curl_config" 2>/dev/null || true)
+    if is_valid_ipv4 "$proxy_ip_v4"; then
+        v4_ok=1
+    fi
+
+    if has_ipv6_stack && ip -6 route show default 2>/dev/null | grep -q 'default'; then
+        cat >"$curl_config" <<EOF
+proxy = "socks5h://127.0.0.1:${SOCKS_PORT}"
+proxy-user = "${SOCKS_USERNAME}:${SOCKS_PASSWORD}"
+url = "https://api64.ipify.org"
+ipv6
+silent
+show-error
+fail
+max-time = 15
+EOF
+        proxy_ip_v6=$(curl --config "$curl_config" 2>/dev/null || true)
+        if is_valid_ipv6 "$proxy_ip_v6"; then
+            v6_ok=1
+        fi
+    fi
+
+    if ((v4_ok == 1 && v6_ok == 1)); then
+        log_success "SOCKS5 认证与双栈转发自检通过（IPv4 出口: ${proxy_ip_v4}，IPv6 出口: ${proxy_ip_v6}）。"
+    elif ((v4_ok == 1)); then
+        log_success "SOCKS5 认证与 IPv4 转发自检通过（出口: ${proxy_ip_v4}）。"
+    elif ((v6_ok == 1)); then
+        log_success "SOCKS5 认证与 IPv6 转发自检通过（出口: ${proxy_ip_v6}）。"
     else
         log_warn "服务已监听，但外网转发自检未通过；请检查日志 ${LOG_FILE}。"
     fi
@@ -1298,7 +1554,7 @@ verify_socks5_authentication() {
 
 print_runtime_status() {
     local service_status="未运行"
-    local display_host dante_version_output dante_version
+    local display_host ipv4_host ipv6_host dante_version_output dante_version
 
     if service_is_active "${APP_NAME}"; then
         service_status="运行中"
@@ -1306,19 +1562,37 @@ print_runtime_status() {
     if [[ -n "$PUBLIC_HOST" ]]; then
         display_host=$PUBLIC_HOST
     else
-        display_host=$(discover_public_ipv4)
+        ipv4_host=$(discover_public_ipv4)
+        ipv6_host=$(discover_public_ipv6)
+        display_host=$ipv4_host
     fi
     dante_version_output=$("$DANTE_BIN" -v 2>&1 || true)
     dante_version=$(sed -n '1p' <<<"$dante_version_output")
 
     printf '\n%sSOCKS5 节点信息 (Alpine OpenRC)%s\n' "$COLOR_BOLD" "$COLOR_RESET"
     printf '  状态：       %s\n' "$service_status"
-    printf '  地址：       %s\n' "$display_host"
-    printf '  端口：       %s\n' "$SOCKS_PORT"
-    printf '  用户名：     %s\n' "$SOCKS_USERNAME"
-    printf '  密码：       %s\n' "$SOCKS_PASSWORD"
-    printf '  连接串：     socks5h://%s:%s@%s:%s\n' \
-        "$SOCKS_USERNAME" "$SOCKS_PASSWORD" "$display_host" "$SOCKS_PORT"
+    if [[ -n "$PUBLIC_HOST" ]]; then
+        printf '  地址：       %s\n' "$display_host"
+        printf '  端口：       %s\n' "$SOCKS_PORT"
+        printf '  用户名：     %s\n' "$SOCKS_USERNAME"
+        printf '  密码：       %s\n' "$SOCKS_PASSWORD"
+        printf '  连接串：     socks5h://%s:%s@%s:%s\n' \
+            "$SOCKS_USERNAME" "$SOCKS_PASSWORD" "$display_host" "$SOCKS_PORT"
+    else
+        printf '  IPv4 地址：  %s\n' "$ipv4_host"
+        if [[ -n "$ipv6_host" ]]; then
+            printf '  IPv6 地址：  %s\n' "$ipv6_host"
+        fi
+        printf '  端口：       %s\n' "$SOCKS_PORT"
+        printf '  用户名：     %s\n' "$SOCKS_USERNAME"
+        printf '  密码：       %s\n' "$SOCKS_PASSWORD"
+        printf '  IPv4 连接串：socks5h://%s:%s@%s:%s\n' \
+            "$SOCKS_USERNAME" "$SOCKS_PASSWORD" "$ipv4_host" "$SOCKS_PORT"
+        if [[ -n "$ipv6_host" ]]; then
+            printf '  IPv6 连接串：socks5h://%s:%s@[%s]:%s\n' \
+                "$SOCKS_USERNAME" "$SOCKS_PASSWORD" "$ipv6_host" "$SOCKS_PORT"
+        fi
+    fi
     printf '  允许来源：   %s\n' "$ALLOW_CIDR"
     printf '  防火墙：     %s%s\n' "$FIREWALL_BACKEND" "${FIREWALL_ZONE:+ (${FIREWALL_ZONE})}"
     printf '  出口网卡：   %s\n' "$EXTERNAL_INTERFACE"
@@ -1452,9 +1726,9 @@ install_action() {
     fi
 
     if [[ -n "$CLI_ALLOW_CIDR" ]]; then
-        ALLOW_CIDR=$(normalize_ipv4_cidr "$CLI_ALLOW_CIDR") || die "无效 IPv4/CIDR：${CLI_ALLOW_CIDR}"
+        ALLOW_CIDR=$(normalize_cidr "$CLI_ALLOW_CIDR") || die "无效 CIDR：${CLI_ALLOW_CIDR}"
     else
-        ALLOW_CIDR="0.0.0.0/0"
+        ALLOW_CIDR="0/0"
     fi
     ALLOW_PRIVATE=$CLI_ALLOW_PRIVATE
 
