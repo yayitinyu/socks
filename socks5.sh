@@ -987,7 +987,7 @@ clientmethod: none
 socksmethod: username
 
 client pass {
-    from: ${ALLOW_CIDR} to: 0.0.0.0/0
+    from: ${ALLOW_CIDR} to: 0/0
     log: connect disconnect error
 }
 EOF
