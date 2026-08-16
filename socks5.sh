@@ -1785,7 +1785,10 @@ install_action() {
     if [[ -n "$CLI_PORT" ]]; then
         is_valid_port "$CLI_PORT" || die "端口必须是 1025-65535 之间的整数。"
         SOCKS_PORT=$((10#$CLI_PORT))
-        wait_for_port_free "$SOCKS_PORT" 3 || true
+        if ((CLI_FORCE == 1)) && port_in_use "$SOCKS_PORT"; then
+            pkill -9 -f "socks5-node" 2>/dev/null || true
+            wait_for_port_free "$SOCKS_PORT" 3 || true
+        fi
     else
         SOCKS_PORT=$(choose_random_port) || die "无法找到空闲高位端口。"
     fi
