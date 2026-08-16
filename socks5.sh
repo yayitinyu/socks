@@ -966,11 +966,7 @@ render_dante_config() {
         "::/128"
         "::1/128"
         "::ffff:0:0/96"
-        "64:ff9b::/96"
-        "100::/64"
-        "2001:2::/48"
         "2001:db8::/32"
-        "2001:10::/28"
         "2002::/16"
         "fc00::/7"
         "fe80::/10"
@@ -979,18 +975,9 @@ render_dante_config() {
 
     cat <<EOF
 # Managed by socks5-node. Manual changes may be overwritten.
-logoutput: syslog
+logoutput: syslog stderr
 
 internal: 0.0.0.0 port = ${SOCKS_PORT}
-EOF
-
-    if has_ipv6_stack; then
-        cat <<EOF
-internal: :: port = ${SOCKS_PORT}
-EOF
-    fi
-
-    cat <<EOF
 external: ${EXTERNAL_INTERFACE}
 
 user.privileged: root
@@ -1000,7 +987,7 @@ clientmethod: none
 socksmethod: username
 
 client pass {
-    from: ${ALLOW_CIDR} to: 0/0
+    from: ${ALLOW_CIDR} to: 0.0.0.0/0
     log: connect disconnect error
 }
 EOF
@@ -1478,7 +1465,11 @@ validate_dante_config() {
 
     if ! validation_output=$("$DANTE_BIN" -V -f "$DANTE_CONFIG_FILE" 2>&1); then
         log_error "Dante 配置校验失败："
-        printf '%s\n' "$validation_output" >&2
+        if [[ -n "$validation_output" ]]; then
+            printf '%s\n' "$validation_output" >&2
+        elif command -v journalctl >/dev/null 2>&1; then
+            journalctl -n 20 --no-pager >&2 || true
+        fi
         return 1
     fi
 }

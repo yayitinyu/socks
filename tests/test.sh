@@ -218,7 +218,8 @@ assert_contains "drops privileges with the Dante 1.4.x directive" "$TEMP_CONFIG"
 assert_not_contains "does not emit the obsolete privilege directive" "$TEMP_CONFIG" "user.notprivileged:"
 assert_contains "requires username authentication" "$TEMP_CONFIG" "socksmethod: username"
 assert_contains "limits authenticated access to the managed group" "$TEMP_CONFIG" "group: s5g_deadbeef"
-assert_contains "limits client source addresses" "$TEMP_CONFIG" "from: 203.0.113.8/32 to: 0/0"
+assert_contains "limits client source addresses" "$TEMP_CONFIG" "from: 203.0.113.8/32 to: 0.0.0.0/0"
+assert_contains "allows dual-stack egress to any destination" "$TEMP_CONFIG" "from: 203.0.113.8/32 to: 0/0"
 assert_contains "blocks cloud metadata and link-local targets" "$TEMP_CONFIG" "to: 169.254.0.0/16"
 assert_contains "blocks IPv6 loopback targets" "$TEMP_CONFIG" "to: ::1/128"
 assert_contains "blocks IPv6 private ULA targets" "$TEMP_CONFIG" "to: fc00::/7"
@@ -552,7 +553,7 @@ assert_contains "Alpine firewall init uses openrc-run shebang" "$TEMP_ALPINE_FIR
 assert_contains "Alpine firewall init calls helper add" "$TEMP_ALPINE_FIREWALL_INIT" '/usr/local/sbin/socks5-node-firewall add'
 assert_contains "Alpine firewall init calls helper remove" "$TEMP_ALPINE_FIREWALL_INIT" '/usr/local/sbin/socks5-node-firewall remove'
 
-assert_contains "Alpine Dante config logs to file" "$TEMP_ALPINE_CONFIG" "logoutput: syslog /var/log/socks5-node.log"
+assert_contains "Alpine Dante config logs to file" "$TEMP_ALPINE_CONFIG" "logoutput: syslog stderr /var/log/socks5-node.log"
 assert_contains "Alpine Dante config binds high port" "$TEMP_ALPINE_CONFIG" "internal: 0.0.0.0 port = 45678"
 assert_contains "Alpine Dante config allows dual-stack egress" "$TEMP_ALPINE_CONFIG" "from: 203.0.113.8/32 to: 0/0"
 assert_contains "Alpine Dante config blocks IPv6 loopback" "$TEMP_ALPINE_CONFIG" "to: ::1/128"
