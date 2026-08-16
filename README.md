@@ -4,7 +4,7 @@
 
 ## 功能
 
-- 原生支持 **IPv4 + IPv6 双栈** 出口转发与入站监听
+- 默认**仅 IPv4 出口**，可用 `--dual-stack` 切换为 IPv4 + IPv6 双栈出口
 - 默认从 `20000-60000` 随机选择未监听的 TCP 端口
 - 随机生成独立的 SOCKS5 用户名与密码
 - 支持 Debian、Ubuntu、RHEL、Rocky Linux、AlmaLinux、CentOS Stream 和 Fedora 的常见 systemd 环境
@@ -12,7 +12,7 @@
 - 在启用 SELinux 的系统上自动管理 `socks_port_t` 端口标签和文件上下文
 - 不会自动启用原本关闭的防火墙，避免意外中断 SSH
 - 默认阻止访问 IPv4 与 IPv6 的环回、内网、链路本地、云元数据和保留地址
-- 配置校验、服务监听检查、正误密码握手检查与真实 SOCKS5 双栈出口自检
+- 配置校验、服务监听检查、正误密码握手检查与真实 SOCKS5 出口自检
 - 支持安全查看安装信息和完整卸载
 
 脚本默认只开放 SOCKS5 的 TCP `CONNECT` 命令，适用于浏览器、下载工具和大多数应用代理场景，不提供 UDP Associate。
@@ -127,6 +127,7 @@ bash socks5_alpine.sh install \
 | `-u, --username USER` | 指定新建的 SOCKS5 系统用户名 |
 | `-P, --password PASS` | 指定 12-128 位安全字符密码 |
 | `--allow-cidr CIDR` | 只允许一个 IPv4 或 IPv6 地址/网段连接；默认 `0/0`（放行全部来源） |
+| `--dual-stack` | 出口启用 IPv4 + IPv6 双栈转发；默认仅使用 IPv4 出口 |
 | `--allow-private` | 允许代理访问 VPS 所在的私网和链路本地地址 |
 | `--no-firewall` | 完全不修改操作系统防火墙 |
 | `-f, --force` | 覆盖已有的旧节点安装并应用新参数 |
@@ -183,14 +184,32 @@ socks5-node uninstall --yes
 
 卸载会删除本脚本创建的服务、防火墙规则、凭据和托管账号，但会保留发行版安装的 Dante 软件包，避免误删其他程序的依赖。
 
+## 出口协议栈说明
+
+客户端使用 `socks5h://` 时，目标域名由 VPS 上的 Dante 解析。在双栈机器上，glibc 按 RFC 6724 把 AAAA 排在前面，Dante 就会优先用 IPv6 出站，导致目标网站看到的全是 VPS 的 IPv6 地址。
+
+因此脚本默认只使用 IPv4 出口：
+
+- **默认（仅 IPv4）**：生成 `external.protocol: ipv4`，出口固定走 IPv4，目标网站看到的是 VPS 的 IPv4 地址。
+- **`--dual-stack`**：不加协议族限制，IPv4 / IPv6 出口都可用，具体走哪个由目标域名的解析结果决定（双栈目标通常是 IPv6）。
+- 未检测到 IPv4 默认路由时（纯 IPv6 小鸡），脚本会自动回退为双栈出口并给出提示。
+
+需要注意，[Dante 只支持协议族的包含与排除，没有优先级机制](https://www.inet.no/dante/doc/1.4.x/config/ipv6.html)，所以无法配置成「IPv4 优先、IPv6 兜底」。若确实需要该行为，只能在系统层面调整 `/etc/gai.conf`（`precedence ::ffff:0:0/96 100`），但那会影响整台机器的域名解析顺序，本脚本不会自动修改。
+
+`external.protocol` 需要 Dante 1.4.1 及以上版本；在更老的 Dante 上，脚本会退回到把出口固定为出口网卡的 IPv4 地址，效果相同。
+
+入站监听始终是 IPv4 通配（`internal: 0.0.0.0`），`--dual-stack` 只影响出口方向。
+
 ## 防火墙说明
 
 脚本只管理 VPS 操作系统内部的防火墙：
 
-- UFW：添加带 `socks5-node-端口` 注释的 TCP 规则（自动处理 IPv4/IPv6）
+- UFW：添加带 `socks5-node-端口` 注释的 TCP 规则
 - firewalld：在出口网卡所属 zone 放行端口或来源受限的 rich rule（支持 IPv4 / IPv6）
 - iptables/ip6tables/nftables：添加带唯一注释的规则，并通过系统服务在重启后恢复
 - 未检测到活动防火墙：不做修改，因为此时系统本身没有阻止该端口
+
+入站放行规则跟随出口模式：默认（仅 IPv4）只放行 IPv4，`--dual-stack` 时同时放行 IPv4 与 IPv6；使用 `--allow-cidr` 指定单一协议族的网段时，只放行对应协议族。卸载时两种协议族的残留规则都会被清理。
 
 启用 SELinux 时（如 RHEL/Fedora），脚本不会关闭或切换到 Permissive 模式，而是为随机端口添加精确的 `socks_port_t` 本地映射；卸载时只删除本脚本创建的映射。若目标端口已有其他本地 SELinux 映射，脚本会换一个随机端口或拒绝覆盖用户指定端口。
 

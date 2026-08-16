@@ -8,23 +8,40 @@ PROJECT_DIR=$(cd -- "${TEST_DIR}/.." && pwd)
 SCRIPT_PATH="${PROJECT_DIR}/socks5.sh"
 TEMP_CONFIG=""
 TEMP_CONFIG_PRIVATE=""
+TEMP_CONFIG_DUAL=""
+TEMP_CONFIG_LEGACY=""
 TEMP_HELPER=""
+TEMP_HELPER_DUAL=""
+TEMP_HELPER_ANY=""
 TEMP_UFW_HELPER=""
+TEMP_UFW_HELPER_ANY=""
 TEMP_FIREWALLD_HELPER=""
 TEMP_IPTABLES_HELPER=""
 TEMP_SERVICE=""
 TEMP_STATE=""
+TEMP_STATE_LEGACY=""
+DANTE_VERSION_SANDBOX=""
 FIREWALL_SANDBOX=""
 
 cleanup() {
     [[ -z "$TEMP_CONFIG" || ! -f "$TEMP_CONFIG" ]] || rm -f -- "$TEMP_CONFIG"
     [[ -z "$TEMP_CONFIG_PRIVATE" || ! -f "$TEMP_CONFIG_PRIVATE" ]] || rm -f -- "$TEMP_CONFIG_PRIVATE"
+    [[ -z "$TEMP_CONFIG_DUAL" || ! -f "$TEMP_CONFIG_DUAL" ]] || rm -f -- "$TEMP_CONFIG_DUAL"
+    [[ -z "$TEMP_CONFIG_LEGACY" || ! -f "$TEMP_CONFIG_LEGACY" ]] || rm -f -- "$TEMP_CONFIG_LEGACY"
     [[ -z "$TEMP_HELPER" || ! -f "$TEMP_HELPER" ]] || rm -f -- "$TEMP_HELPER"
+    [[ -z "$TEMP_HELPER_DUAL" || ! -f "$TEMP_HELPER_DUAL" ]] || rm -f -- "$TEMP_HELPER_DUAL"
+    [[ -z "$TEMP_HELPER_ANY" || ! -f "$TEMP_HELPER_ANY" ]] || rm -f -- "$TEMP_HELPER_ANY"
     [[ -z "$TEMP_UFW_HELPER" || ! -f "$TEMP_UFW_HELPER" ]] || rm -f -- "$TEMP_UFW_HELPER"
+    [[ -z "$TEMP_UFW_HELPER_ANY" || ! -f "$TEMP_UFW_HELPER_ANY" ]] || rm -f -- "$TEMP_UFW_HELPER_ANY"
     [[ -z "$TEMP_FIREWALLD_HELPER" || ! -f "$TEMP_FIREWALLD_HELPER" ]] || rm -f -- "$TEMP_FIREWALLD_HELPER"
     [[ -z "$TEMP_IPTABLES_HELPER" || ! -f "$TEMP_IPTABLES_HELPER" ]] || rm -f -- "$TEMP_IPTABLES_HELPER"
     [[ -z "$TEMP_SERVICE" || ! -f "$TEMP_SERVICE" ]] || rm -f -- "$TEMP_SERVICE"
     [[ -z "$TEMP_STATE" || ! -f "$TEMP_STATE" ]] || rm -f -- "$TEMP_STATE"
+    [[ -z "$TEMP_STATE_LEGACY" || ! -f "$TEMP_STATE_LEGACY" ]] || rm -f -- "$TEMP_STATE_LEGACY"
+    if [[ -n "$DANTE_VERSION_SANDBOX" && -d "$DANTE_VERSION_SANDBOX" ]]; then
+        rm -f -- "$DANTE_VERSION_SANDBOX/danted"
+        rmdir -- "$DANTE_VERSION_SANDBOX"
+    fi
     if [[ -n "$FIREWALL_SANDBOX" && -d "$FIREWALL_SANDBOX" ]]; then
         rm -f -- \
             "$FIREWALL_SANDBOX/bin/ufw" \
@@ -112,6 +129,23 @@ assert_file_exists() {
     if [[ -f "$file" ]]; then
         pass "$description"
     else
+        fail "$description"
+    fi
+}
+
+assert_line_order() {
+    local description=$1
+    local file=$2
+    local first_pattern=$3
+    local second_pattern=$4
+    local first_line second_line
+
+    first_line=$(awk -v pattern="$first_pattern" '$0 ~ pattern { print NR; exit }' "$file")
+    second_line=$(awk -v pattern="$second_pattern" '$0 ~ pattern { print NR; exit }' "$file")
+    if [[ -n "$first_line" && -n "$second_line" ]] && ((first_line < second_line)); then
+        pass "$description"
+    else
+        printf 'Expected %s before %s in %s\n' "$first_pattern" "$second_pattern" "$file" >&2
         fail "$description"
     fi
 }
@@ -219,7 +253,7 @@ assert_not_contains "does not emit the obsolete privilege directive" "$TEMP_CONF
 assert_contains "requires username authentication" "$TEMP_CONFIG" "socksmethod: username"
 assert_contains "limits authenticated access to the managed group" "$TEMP_CONFIG" "group: s5g_deadbeef"
 assert_contains "limits client source addresses" "$TEMP_CONFIG" "from: 203.0.113.8/32 to: 0/0"
-assert_contains "allows dual-stack egress to any destination" "$TEMP_CONFIG" "from: 203.0.113.8/32 to: 0/0"
+assert_contains "matches destinations of both address families" "$TEMP_CONFIG" "from: 203.0.113.8/32 to: 0/0"
 assert_contains "blocks cloud metadata and link-local targets" "$TEMP_CONFIG" "to: 169.254.0.0/16"
 assert_contains "blocks IPv6 loopback targets" "$TEMP_CONFIG" "to: ::1/128"
 assert_contains "blocks IPv6 private ULA targets" "$TEMP_CONFIG" "to: fc00::/7"
@@ -231,6 +265,47 @@ export ALLOW_PRIVATE=1
 TEMP_CONFIG_PRIVATE=$(mktemp)
 render_dante_config >"$TEMP_CONFIG_PRIVATE"
 assert_not_contains "allow-private removes private destination blocks" "$TEMP_CONFIG_PRIVATE" "socks block {"
+export ALLOW_PRIVATE=0
+
+# 出口协议栈：默认仅 IPv4，--dual-stack 才放开 IPv6
+assert_contains "default egress restricts Dante to IPv4" "$TEMP_CONFIG" "external.protocol: ipv4"
+assert_line_order "protocol keyword precedes the external interface" \
+    "$TEMP_CONFIG" '^external[.]protocol:' '^external:'
+
+export DUAL_STACK=1
+TEMP_CONFIG_DUAL=$(mktemp)
+render_dante_config >"$TEMP_CONFIG_DUAL"
+assert_not_contains "--dual-stack keeps both address families" "$TEMP_CONFIG_DUAL" "external.protocol:"
+assert_contains "--dual-stack still egresses via the detected interface" "$TEMP_CONFIG_DUAL" "external: eth0"
+
+export DUAL_STACK=0
+export DANTE_PROTOCOL_SUPPORTED=0
+export EXTERNAL_ADDRESS=203.0.113.10
+TEMP_CONFIG_LEGACY=$(mktemp)
+render_dante_config >"$TEMP_CONFIG_LEGACY"
+assert_not_contains "old Dante omits the unsupported protocol keyword" "$TEMP_CONFIG_LEGACY" "external.protocol:"
+assert_contains "old Dante pins egress to the interface IPv4 address" "$TEMP_CONFIG_LEGACY" "external: 203.0.113.10"
+export DANTE_PROTOCOL_SUPPORTED=1
+export EXTERNAL_ADDRESS=""
+
+DANTE_VERSION_SANDBOX=$(mktemp -d)
+fake_dante_version() {
+    printf '#!/usr/bin/env bash\nprintf "%%s\\n" "%s"\n' "$1" >"$DANTE_VERSION_SANDBOX/danted"
+    chmod 700 "$DANTE_VERSION_SANDBOX/danted"
+}
+export DANTE_BIN="$DANTE_VERSION_SANDBOX/danted"
+fake_dante_version "Dante v1.4.1"
+assert_true "detects protocol keyword support on Dante 1.4.1" dante_supports_protocol_keyword
+fake_dante_version "Dante v1.4.3"
+assert_true "detects protocol keyword support on Dante 1.4.3" dante_supports_protocol_keyword
+fake_dante_version "Dante v1.5.0"
+assert_true "detects protocol keyword support on a newer major.minor" dante_supports_protocol_keyword
+fake_dante_version "Dante v1.4.0"
+assert_false "rejects protocol keyword support on Dante 1.4.0" dante_supports_protocol_keyword
+fake_dante_version "Dante v1.3.2"
+assert_false "rejects protocol keyword support on Dante 1.3.2" dante_supports_protocol_keyword
+fake_dante_version "unparsable version banner"
+assert_true "assumes protocol keyword support when the version is unreadable" dante_supports_protocol_keyword
 
 export DANTE_BIN=/usr/sbin/danted
 TEMP_SERVICE=$(mktemp)
@@ -247,8 +322,18 @@ render_firewall_helper >"$TEMP_HELPER"
 assert_true "generated firewall helper has valid Bash syntax" bash -n "$TEMP_HELPER"
 assert_contains "firewall helper carries the selected port" "$TEMP_HELPER" "PORT=45678"
 assert_contains "firewall helper carries the source CIDR" "$TEMP_HELPER" "ALLOW_CIDR=203.0.113.8/32"
+assert_contains "firewall helper carries the egress stack mode" "$TEMP_HELPER" "DUAL_STACK=0"
 assert_contains "nftables rule has an ownership comment" "$TEMP_HELPER" "comment \"\$COMMENT\""
 assert_contains "iptables rule has an ownership comment" "$TEMP_HELPER" "--comment \"\$COMMENT\""
+
+export DUAL_STACK=1
+TEMP_HELPER_DUAL=$(mktemp)
+render_firewall_helper >"$TEMP_HELPER_DUAL"
+assert_true "dual-stack firewall helper has valid Bash syntax" bash -n "$TEMP_HELPER_DUAL"
+assert_contains "dual-stack firewall helper records the stack mode" "$TEMP_HELPER_DUAL" "DUAL_STACK=1"
+assert_contains "IPv4-only mode narrows wildcard nftables rules" "$TEMP_HELPER" "meta nfproto ipv4 tcp dport"
+assert_contains "IPv4-only mode narrows wildcard ufw rules" "$TEMP_HELPER" "ufw allow proto tcp from 0.0.0.0/0 to any port"
+export DUAL_STACK=0
 
 FIREWALL_SANDBOX=$(mktemp -d)
 mkdir -p "$FIREWALL_SANDBOX/bin"
@@ -414,6 +499,33 @@ FAKE_NFT_STATE="$FIREWALL_SANDBOX/nft.state" \
     PATH="$FIREWALL_SANDBOX/bin:$PATH" "$TEMP_HELPER" remove
 assert_file_absent "nftables remove deletes the owned rule by handle" "$FIREWALL_SANDBOX/nft.state"
 
+# 通配来源 + 仅 IPv4：真正执行生成的 helper，确认新分支在 set -e 下能跑通
+export ALLOW_CIDR=0/0
+TEMP_HELPER_ANY=$(mktemp)
+render_firewall_helper >"$TEMP_HELPER_ANY"
+chmod 700 "$TEMP_HELPER_ANY"
+FAKE_NFT_STATE="$FIREWALL_SANDBOX/nft.state" \
+    PATH="$FIREWALL_SANDBOX/bin:$PATH" "$TEMP_HELPER_ANY" add
+assert_file_exists "IPv4-only wildcard source applies an nftables rule" "$FIREWALL_SANDBOX/nft.state"
+FAKE_NFT_STATE="$FIREWALL_SANDBOX/nft.state" \
+    PATH="$FIREWALL_SANDBOX/bin:$PATH" "$TEMP_HELPER_ANY" remove
+assert_file_absent "IPv4-only wildcard nftables rule is removed" "$FIREWALL_SANDBOX/nft.state"
+
+export FIREWALL_BACKEND=ufw
+TEMP_UFW_HELPER_ANY=$(mktemp)
+render_firewall_helper >"$TEMP_UFW_HELPER_ANY"
+chmod 700 "$TEMP_UFW_HELPER_ANY"
+rm -f -- "$FIREWALL_SANDBOX/ufw.state"
+FAKE_UFW_STATE="$FIREWALL_SANDBOX/ufw.state" \
+    PATH="$FIREWALL_SANDBOX/bin:$PATH" "$TEMP_UFW_HELPER_ANY" add
+assert_file_exists "IPv4-only wildcard source applies a UFW rule" "$FIREWALL_SANDBOX/ufw.state"
+FAKE_UFW_STATE="$FIREWALL_SANDBOX/ufw.state" \
+    PATH="$FIREWALL_SANDBOX/bin:$PATH" "$TEMP_UFW_HELPER_ANY" remove
+assert_file_absent "IPv4-only wildcard UFW rule is removed" "$FIREWALL_SANDBOX/ufw.state"
+
+export ALLOW_CIDR=203.0.113.8/32
+export FIREWALL_BACKEND=nftables
+
 cat >"$FIREWALL_SANDBOX/bin/semanage" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -494,6 +606,21 @@ else
     fail "state round-trip preserves credentials and ownership markers"
 fi
 
+assert_contains "state records the egress stack mode" "$TEMP_STATE" "DUAL_STACK="
+
+# 旧状态文件没有 DUAL_STACK，当时的出口行为是双栈，加载时应补成 1
+TEMP_STATE_LEGACY=$(mktemp)
+grep -v '^DUAL_STACK=' "$TEMP_STATE" >"$TEMP_STATE_LEGACY"
+(
+    export SOCKS5_NODE_LIB_ONLY=1
+    # shellcheck disable=SC1090
+    source "$SCRIPT_PATH"
+    export STATE_FILE=$TEMP_STATE_LEGACY
+    load_state
+    [[ "$DUAL_STACK" == "1" ]]
+) || fail "legacy state without DUAL_STACK keeps dual-stack egress"
+pass "legacy state without DUAL_STACK keeps dual-stack egress"
+
 # ==================== Alpine OpenRC Tests ====================
 ALPINESCRIPT_PATH="${PROJECT_DIR}/socks5_alpine.sh"
 assert_true "socks5_alpine.sh has valid Bash syntax" bash -n "$ALPINESCRIPT_PATH"
@@ -501,6 +628,7 @@ assert_true "socks5_alpine.sh has valid Bash syntax" bash -n "$ALPINESCRIPT_PATH
 TEMP_ALPINE_SERVICE=$(mktemp)
 TEMP_ALPINE_FIREWALL_INIT=$(mktemp)
 TEMP_ALPINE_CONFIG=$(mktemp)
+TEMP_ALPINE_CONFIG_DUAL=$(mktemp)
 TEMP_ALPINE_STATE=$(mktemp)
 
 # Source socks5_alpine.sh in isolation
@@ -519,6 +647,7 @@ TEMP_ALPINE_STATE=$(mktemp)
     export LOG_FILE=/var/log/socks5-node.log
 
     render_dante_config >"$TEMP_ALPINE_CONFIG"
+    DUAL_STACK=1 render_dante_config >"$TEMP_ALPINE_CONFIG_DUAL"
     render_service_init >"$TEMP_ALPINE_SERVICE"
     render_firewall_init >"$TEMP_ALPINE_FIREWALL_INIT"
 
@@ -555,8 +684,13 @@ assert_contains "Alpine firewall init calls helper remove" "$TEMP_ALPINE_FIREWAL
 
 assert_contains "Alpine Dante config logs to file" "$TEMP_ALPINE_CONFIG" "logoutput: syslog stderr /var/log/socks5-node.log"
 assert_contains "Alpine Dante config binds high port" "$TEMP_ALPINE_CONFIG" "internal: 0.0.0.0 port = 45678"
-assert_contains "Alpine Dante config allows dual-stack egress" "$TEMP_ALPINE_CONFIG" "from: 203.0.113.8/32 to: 0/0"
+assert_contains "Alpine Dante config matches destinations of both address families" "$TEMP_ALPINE_CONFIG" "from: 203.0.113.8/32 to: 0/0"
 assert_contains "Alpine Dante config blocks IPv6 loopback" "$TEMP_ALPINE_CONFIG" "to: ::1/128"
+assert_contains "Alpine default egress restricts Dante to IPv4" "$TEMP_ALPINE_CONFIG" "external.protocol: ipv4"
+assert_line_order "Alpine protocol keyword precedes the external interface" \
+    "$TEMP_ALPINE_CONFIG" '^external[.]protocol:' '^external:'
+assert_not_contains "Alpine --dual-stack keeps both address families" "$TEMP_ALPINE_CONFIG_DUAL" "external.protocol:"
+assert_contains "Alpine --dual-stack still egresses via the detected interface" "$TEMP_ALPINE_CONFIG_DUAL" "external: eth0"
 
 # Test CLI args and environment port parsing
 (
@@ -651,7 +785,34 @@ pass "parse_args handles --force flag"
 ) || fail "Alpine parse_args handles --reinstall flag"
 pass "Alpine parse_args handles --reinstall flag"
 
-rm -f -- "$TEMP_ALPINE_SERVICE" "$TEMP_ALPINE_FIREWALL_INIT" "$TEMP_ALPINE_CONFIG" "$TEMP_ALPINE_STATE"
+rm -f -- "$TEMP_ALPINE_SERVICE" "$TEMP_ALPINE_FIREWALL_INIT" "$TEMP_ALPINE_CONFIG" "$TEMP_ALPINE_CONFIG_DUAL" "$TEMP_ALPINE_STATE"
+
+(
+    export SOCKS5_NODE_LIB_ONLY=1
+    # shellcheck disable=SC1090
+    source "$SCRIPT_PATH"
+    parse_args --dual-stack
+    [[ "$CLI_DUAL_STACK" -eq 1 && "$CONFIG_OVERRIDES" -eq 1 ]]
+) || fail "parse_args handles --dual-stack flag"
+pass "parse_args handles --dual-stack flag"
+
+(
+    export SOCKS5_NODE_LIB_ONLY=1
+    # shellcheck disable=SC1090
+    source "$SCRIPT_PATH"
+    parse_args
+    [[ "$CLI_DUAL_STACK" -eq 0 ]]
+) || fail "install defaults to IPv4-only egress"
+pass "install defaults to IPv4-only egress"
+
+(
+    export SOCKS5_NODE_LIB_ONLY=1
+    # shellcheck disable=SC1090
+    source "$ALPINESCRIPT_PATH"
+    parse_args --dual-stack
+    [[ "$CLI_DUAL_STACK" -eq 1 && "$CONFIG_OVERRIDES" -eq 1 ]]
+) || fail "Alpine parse_args handles --dual-stack flag"
+pass "Alpine parse_args handles --dual-stack flag"
 
 printf '1..%d\n' "$TESTS_RUN"
 

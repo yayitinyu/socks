@@ -45,6 +45,7 @@ CLI_ALLOW_CIDR=""
 CLI_ALLOW_PRIVATE=0
 CLI_DISABLE_FIREWALL=0
 CLI_HOST=""
+CLI_DUAL_STACK=0
 REMOTE_SCRIPT_URL="https://raw.githubusercontent.com/yayitinyu/socks/main/socks5_alpine.sh"
 
 SOCKS_PORT=""
@@ -53,7 +54,10 @@ SOCKS_PASSWORD=""
 PUBLIC_HOST="${PUBLIC_HOST:-}"
 ALLOW_CIDR="0/0"
 ALLOW_PRIVATE=0
+DUAL_STACK=0
 EXTERNAL_INTERFACE=""
+EXTERNAL_ADDRESS=""
+DANTE_PROTOCOL_SUPPORTED=1
 DANTE_BIN=""
 FIREWALL_BACKEND="none"
 FIREWALL_ZONE=""
@@ -129,6 +133,7 @@ Alpine Linux SOCKS5 一键安装脚本 (OpenRC)
   -u, --username USER      指定认证用户名；默认随机生成
   -P, --password PASS      指定认证密码；默认随机生成
       --allow-cidr CIDR    只允许指定 IPv4 / IPv6 地址或网段连接；默认 0/0 放行全部
+      --dual-stack         出口启用 IPv4+IPv6 双栈转发；默认仅使用 IPv4 出口
       --allow-private      允许代理访问内网、环回及链路本地地址
       --no-firewall        不修改 VPS 操作系统防火墙
   -f, --force, --reinstall 覆盖已有的旧节点安装
@@ -301,6 +306,11 @@ parse_args() {
                 ;;
             --allow-private)
                 CLI_ALLOW_PRIVATE=1
+                CONFIG_OVERRIDES=1
+                shift
+                ;;
+            --dual-stack)
+                CLI_DUAL_STACK=1
                 CONFIG_OVERRIDES=1
                 shift
                 ;;
@@ -627,7 +637,10 @@ load_state() {
     PUBLIC_HOST=""
     ALLOW_CIDR=""
     ALLOW_PRIVATE=""
+    DUAL_STACK=""
     EXTERNAL_INTERFACE=""
+    EXTERNAL_ADDRESS=""
+    DANTE_PROTOCOL_SUPPORTED=""
     DANTE_BIN=""
     FIREWALL_BACKEND=""
     FIREWALL_ZONE=""
@@ -649,6 +662,10 @@ load_state() {
     source "$STATE_FILE"
 
     [[ "${STATE_VERSION:-}" == "1" ]] || die "不支持的状态文件版本。"
+    # 旧版状态文件没有 DUAL_STACK；当时安装的出口行为是双栈，按 1 补齐。
+    DUAL_STACK=${DUAL_STACK:-1}
+    DANTE_PROTOCOL_SUPPORTED=${DANTE_PROTOCOL_SUPPORTED:-1}
+    EXTERNAL_ADDRESS=${EXTERNAL_ADDRESS:-}
     is_valid_port "$SOCKS_PORT" || die "状态文件中的端口无效。"
     is_valid_username "$SOCKS_USERNAME" || die "状态文件中的用户名无效。"
     is_valid_password "$SOCKS_PASSWORD" || die "状态文件中的密码无效。"
@@ -657,7 +674,10 @@ load_state() {
     fi
     is_valid_cidr "$ALLOW_CIDR" || die "状态文件中的允许网段无效。"
     [[ "$ALLOW_PRIVATE" == "0" || "$ALLOW_PRIVATE" == "1" ]] || die "状态文件中的私网选项无效。"
+    [[ "$DUAL_STACK" == "0" || "$DUAL_STACK" == "1" ]] || die "状态文件中的双栈选项无效。"
     [[ "$EXTERNAL_INTERFACE" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || die "状态文件中的出口网卡无效。"
+    [[ -z "$EXTERNAL_ADDRESS" ]] || is_valid_ipv4 "$EXTERNAL_ADDRESS" || die "状态文件中的出口地址无效。"
+    [[ "$DANTE_PROTOCOL_SUPPORTED" == "0" || "$DANTE_PROTOCOL_SUPPORTED" == "1" ]] || die "状态文件中的 Dante 协议标记无效。"
     [[ "$DANTE_BIN" =~ ^/[A-Za-z0-9_./-]+$ ]] || die "状态文件中的 Dante 路径无效。"
     case "$FIREWALL_BACKEND" in
         ufw | firewalld | iptables | nftables | none | disabled) ;;
@@ -762,6 +782,58 @@ has_ipv6_stack() {
     [[ -d /proc/sys/net/ipv6 ]] && return 0
     command -v ip >/dev/null 2>&1 && ip -6 addr show >/dev/null 2>&1 && return 0
     return 1
+}
+
+has_ipv4_default_route() {
+    command -v ip >/dev/null 2>&1 || return 1
+    [[ -n $(ip -4 route show default 2>/dev/null) ]]
+}
+
+first_global_ipv4_on_interface() {
+    local interface=$1
+    local address
+
+    address=$(ip -4 -o addr show dev "$interface" scope global 2>/dev/null \
+        | awk 'NR == 1 { split($4, parts, "/"); print parts[1] }')
+    is_valid_ipv4 "$address" || return 1
+    printf '%s\n' "$address"
+}
+
+# Dante 1.4.1 起支持 internal.protocol / external.protocol 关键字。
+# 版本输出无法解析时按支持处理，由 validate_dante_config 兜底。
+dante_supports_protocol_keyword() {
+    local version_output major minor patch
+
+    version_output=$("$DANTE_BIN" -v 2>&1 || true)
+    [[ "$version_output" =~ v?([0-9]+)\.([0-9]+)\.([0-9]+) ]] || return 0
+    major=$((10#${BASH_REMATCH[1]}))
+    minor=$((10#${BASH_REMATCH[2]}))
+    patch=$((10#${BASH_REMATCH[3]}))
+    ((major > 1)) && return 0
+    ((major == 1 && (minor > 4 || (minor == 4 && patch >= 1))))
+}
+
+resolve_stack_mode() {
+    DUAL_STACK=0
+    EXTERNAL_ADDRESS=""
+    DANTE_PROTOCOL_SUPPORTED=1
+
+    if ((CLI_DUAL_STACK == 1)); then
+        DUAL_STACK=1
+    elif has_ipv4_default_route; then
+        log_info "出口模式：仅 IPv4（默认）；如需 IPv4+IPv6 双栈出口请加 --dual-stack。"
+    elif has_ipv6_stack; then
+        DUAL_STACK=1
+        log_warn "未检测到 IPv4 默认路由，自动回退为双栈出口。"
+    fi
+
+    if ((DUAL_STACK == 0)) && ! dante_supports_protocol_keyword; then
+        # 旧版 Dante 不支持 external.protocol；固定出口地址同样能阻止 IPv6 出站。
+        DANTE_PROTOCOL_SUPPORTED=0
+        log_warn "Dante 版本低于 1.4.1，不支持 external.protocol，将出口固定为网卡 IPv4 地址。"
+        EXTERNAL_ADDRESS=$(first_global_ipv4_on_interface "$EXTERNAL_INTERFACE") \
+            || die "无法确定网卡 ${EXTERNAL_INTERFACE} 的 IPv4 地址，无法启用仅 IPv4 出口；可尝试 --dual-stack。"
+    fi
 }
 
 detect_external_interface() {
@@ -910,7 +982,15 @@ render_dante_config() {
 logoutput: syslog stderr ${LOG_FILE}
 
 internal: 0.0.0.0 port = ${SOCKS_PORT}
-external: ${EXTERNAL_INTERFACE}
+EOF
+
+    # Dante 只有协议族包含/排除，没有优先级；默认用 external.protocol 限制为仅 IPv4 出口。
+    if ((DUAL_STACK == 0 && DANTE_PROTOCOL_SUPPORTED == 1)); then
+        printf 'external.protocol: ipv4\n'
+    fi
+
+    cat <<EOF
+external: ${EXTERNAL_ADDRESS:-$EXTERNAL_INTERFACE}
 
 user.privileged: root
 user.unprivileged: ${DAEMON_USER}
@@ -1059,13 +1139,14 @@ detect_firewalld_zone() {
 }
 
 render_firewall_helper() {
-    local quoted_port quoted_cidr quoted_backend quoted_zone quoted_comment
+    local quoted_port quoted_cidr quoted_backend quoted_zone quoted_comment quoted_dual_stack
 
     printf -v quoted_port '%q' "$SOCKS_PORT"
     printf -v quoted_cidr '%q' "$ALLOW_CIDR"
     printf -v quoted_backend '%q' "$FIREWALL_BACKEND"
     printf -v quoted_zone '%q' "$FIREWALL_ZONE"
     printf -v quoted_comment '%q' "socks5-node-${SOCKS_PORT}"
+    printf -v quoted_dual_stack '%q' "$DUAL_STACK"
 
     cat <<EOF
 #!/usr/bin/env bash
@@ -1075,6 +1156,7 @@ IFS=\$'\\n\\t'
 
 PORT=${quoted_port}
 ALLOW_CIDR=${quoted_cidr}
+DUAL_STACK=${quoted_dual_stack}
 BACKEND=${quoted_backend}
 ZONE=${quoted_zone}
 COMMENT=${quoted_comment}
@@ -1122,8 +1204,10 @@ ufw_add() {
     if [[ "$status_output" == *"$COMMENT"* ]]; then
         return
     fi
-    if is_any_cidr "$ALLOW_CIDR"; then
+    if is_any_cidr "$ALLOW_CIDR" && ((DUAL_STACK == 1)); then
         ufw allow proto tcp to any port "$PORT" comment "$COMMENT"
+    elif is_any_cidr "$ALLOW_CIDR"; then
+        ufw allow proto tcp from 0.0.0.0/0 to any port "$PORT" comment "$COMMENT"
     else
         ufw allow proto tcp from "$ALLOW_CIDR" to any port "$PORT" comment "$COMMENT"
     fi
@@ -1150,11 +1234,10 @@ ufw_remove() {
             ufw --force delete "$number" >/dev/null
         done
     else
-        if is_any_cidr "$ALLOW_CIDR"; then
-            ufw --force delete allow proto tcp to any port "$PORT" >/dev/null 2>&1 || true
-        else
-            ufw --force delete allow proto tcp from "$ALLOW_CIDR" to any port "$PORT" >/dev/null 2>&1 || true
-        fi
+        # 逐个尝试历史上生成过的规则形态，保证模式切换后残留规则也能清掉。
+        ufw --force delete allow proto tcp to any port "$PORT" >/dev/null 2>&1 || true
+        ufw --force delete allow proto tcp from 0.0.0.0/0 to any port "$PORT" >/dev/null 2>&1 || true
+        ufw --force delete allow proto tcp from "$ALLOW_CIDR" to any port "$PORT" >/dev/null 2>&1 || true
     fi
 
     added_output=$(LC_ALL=C ufw show added 2>/dev/null || true)
@@ -1163,7 +1246,7 @@ ufw_remove() {
 
 firewalld_add() {
     firewall-cmd --state >/dev/null 2>&1 || return 1
-    if is_any_cidr "$ALLOW_CIDR"; then
+    if is_any_cidr "$ALLOW_CIDR" && ((DUAL_STACK == 1)); then
         if ! firewall-cmd --permanent --zone="$ZONE" --query-port="${PORT}/tcp" >/dev/null 2>&1; then
             firewall-cmd --permanent --zone="$ZONE" --add-port="${PORT}/tcp" >/dev/null
         fi
@@ -1175,7 +1258,11 @@ firewalld_add() {
         if is_ipv6_cidr "$ALLOW_CIDR"; then
             family="ipv6"
         fi
-        rule="rule family=\"${family}\" source address=\"${ALLOW_CIDR}\" port port=\"${PORT}\" protocol=\"tcp\" accept"
+        if is_any_cidr "$ALLOW_CIDR"; then
+            rule="rule family=\"ipv4\" port port=\"${PORT}\" protocol=\"tcp\" accept"
+        else
+            rule="rule family=\"${family}\" source address=\"${ALLOW_CIDR}\" port port=\"${PORT}\" protocol=\"tcp\" accept"
+        fi
         if ! firewall-cmd --permanent --zone="$ZONE" --query-rich-rule="$rule" >/dev/null 2>&1; then
             firewall-cmd --permanent --zone="$ZONE" --add-rich-rule="$rule" >/dev/null
         fi
@@ -1188,11 +1275,18 @@ firewalld_add() {
 firewalld_remove() {
     firewall-cmd --state >/dev/null 2>&1 || return 1
     if is_any_cidr "$ALLOW_CIDR"; then
+        local v4_rule="rule family=\"ipv4\" port port=\"${PORT}\" protocol=\"tcp\" accept"
         if firewall-cmd --permanent --zone="$ZONE" --query-port="${PORT}/tcp" >/dev/null 2>&1; then
             firewall-cmd --permanent --zone="$ZONE" --remove-port="${PORT}/tcp" >/dev/null
         fi
         if firewall-cmd --zone="$ZONE" --query-port="${PORT}/tcp" >/dev/null 2>&1; then
             firewall-cmd --zone="$ZONE" --remove-port="${PORT}/tcp" >/dev/null
+        fi
+        if firewall-cmd --permanent --zone="$ZONE" --query-rich-rule="$v4_rule" >/dev/null 2>&1; then
+            firewall-cmd --permanent --zone="$ZONE" --remove-rich-rule="$v4_rule" >/dev/null
+        fi
+        if firewall-cmd --zone="$ZONE" --query-rich-rule="$v4_rule" >/dev/null 2>&1; then
+            firewall-cmd --zone="$ZONE" --remove-rich-rule="$v4_rule" >/dev/null
         fi
     else
         local family="ipv4" rule
@@ -1214,7 +1308,9 @@ iptables_add() {
 
     if is_any_cidr "$ALLOW_CIDR"; then
         rule_v4=(-p tcp --dport "$PORT" -m comment --comment "$COMMENT" -j ACCEPT)
-        rule_v6=(-p tcp --dport "$PORT" -m comment --comment "$COMMENT" -j ACCEPT)
+        if ((DUAL_STACK == 1)); then
+            rule_v6=(-p tcp --dport "$PORT" -m comment --comment "$COMMENT" -j ACCEPT)
+        fi
     elif is_ipv6_cidr "$ALLOW_CIDR"; then
         rule_v6=(-p tcp -s "$ALLOW_CIDR" --dport "$PORT" -m comment --comment "$COMMENT" -j ACCEPT)
     else
@@ -1278,8 +1374,13 @@ nftables_add() {
         rules=$(nft -a list chain "$family" "$table_name" "$chain_name" 2>/dev/null || true)
         if [[ "$rules" != *"comment \"$COMMENT\""* ]]; then
             if is_any_cidr "$ALLOW_CIDR"; then
-                nft insert rule "$family" "$table_name" "$chain_name" \
-                    tcp dport "$PORT" counter accept comment "$COMMENT"
+                if [[ "$DUAL_STACK" == "1" ]]; then
+                    nft insert rule "$family" "$table_name" "$chain_name" \
+                        tcp dport "$PORT" counter accept comment "$COMMENT"
+                elif [[ "$family" != "ip6" ]]; then
+                    nft insert rule "$family" "$table_name" "$chain_name" \
+                        meta nfproto ipv4 tcp dport "$PORT" counter accept comment "$COMMENT"
+                fi
             elif is_ipv6_cidr "$ALLOW_CIDR"; then
                 if [[ "$family" == "ip6" || "$family" == "inet" ]]; then
                     nft insert rule "$family" "$table_name" "$chain_name" \
@@ -1393,7 +1494,8 @@ render_state() {
     local key value
     local -a keys=(
         STATE_VERSION SOCKS_PORT SOCKS_USERNAME SOCKS_PASSWORD PUBLIC_HOST ALLOW_CIDR ALLOW_PRIVATE
-        EXTERNAL_INTERFACE DANTE_BIN FIREWALL_BACKEND FIREWALL_ZONE AUTH_GROUP AUTH_GROUP_GID
+        DUAL_STACK EXTERNAL_INTERFACE EXTERNAL_ADDRESS DANTE_PROTOCOL_SUPPORTED
+        DANTE_BIN FIREWALL_BACKEND FIREWALL_ZONE AUTH_GROUP AUTH_GROUP_GID
         AUTH_USER_UID DAEMON_USER DAEMON_USER_UID DAEMON_GROUP DAEMON_GROUP_GID INSTALLED_AT
         DANTE_WAS_PRESENT DANTE_CONFIG_DIR_CREATED SELINUX_ENABLED SELINUX_PORT_MANAGED
     )
@@ -1481,7 +1583,7 @@ EOF
         v4_ok=1
     fi
 
-    if has_ipv6_stack && ip -6 route show default 2>/dev/null | grep -q 'default'; then
+    if ((DUAL_STACK == 1)) && has_ipv6_stack && ip -6 route show default 2>/dev/null | grep -q 'default'; then
         cat >"$curl_config" <<EOF
 proxy = "socks5h://127.0.0.1:${SOCKS_PORT}"
 proxy-user = "${SOCKS_USERNAME}:${SOCKS_PASSWORD}"
@@ -1567,7 +1669,11 @@ print_runtime_status() {
         display_host=$PUBLIC_HOST
     else
         ipv4_host=$(discover_public_ipv4)
-        ipv6_host=$(discover_public_ipv6)
+        if ((DUAL_STACK == 1)); then
+            ipv6_host=$(discover_public_ipv6)
+        else
+            ipv6_host=""
+        fi
         display_host=$ipv4_host
     fi
     dante_version_output=$("$DANTE_BIN" -v 2>&1 || true)
@@ -1598,6 +1704,11 @@ print_runtime_status() {
         fi
     fi
     printf '  允许来源：   %s\n' "$ALLOW_CIDR"
+    if ((DUAL_STACK == 1)); then
+        printf '  出口协议栈： IPv4 + IPv6（--dual-stack）\n'
+    else
+        printf '  出口协议栈： 仅 IPv4\n'
+    fi
     printf '  防火墙：     %s%s\n' "$FIREWALL_BACKEND" "${FIREWALL_ZONE:+ (${FIREWALL_ZONE})}"
     printf '  出口网卡：   %s\n' "$EXTERNAL_INTERFACE"
     printf '  Dante：      %s\n' "${dante_version:-未知版本}"
@@ -1750,6 +1861,8 @@ install_action() {
     fi
     EXTERNAL_INTERFACE=$(detect_external_interface)
     log_info "IPv4 出口网卡：${EXTERNAL_INTERFACE}"
+
+    resolve_stack_mode
 
     generate_managed_identities
     create_managed_accounts
