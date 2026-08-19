@@ -669,9 +669,41 @@ find_dante_binary() {
         command -v danted
     elif command -v sockd >/dev/null 2>&1; then
         command -v sockd
+    elif [[ -x /usr/sbin/danted ]]; then
+        printf '%s\n' "/usr/sbin/danted"
+    elif [[ -x /usr/sbin/sockd ]]; then
+        printf '%s\n' "/usr/sbin/sockd"
+    elif [[ -x /usr/local/sbin/danted ]]; then
+        printf '%s\n' "/usr/local/sbin/danted"
+    elif [[ -x /usr/local/sbin/sockd ]]; then
+        printf '%s\n' "/usr/local/sbin/sockd"
     else
         return 1
     fi
+}
+
+compile_and_install_dante() {
+    local temp_build_dir
+    local tarball_url="https://www.inet.no/dante/files/dante-1.4.3.tar.gz"
+
+    temp_build_dir=$(mktemp -d /tmp/dante-build.XXXXXX)
+    TEMP_FILES+=("$temp_build_dir")
+
+    log_info "正在下载 Dante 1.4.3 源码..."
+    if ! curl -fsSL "$tarball_url" -o "${temp_build_dir}/dante.tar.gz"; then
+        die "下载 Dante 源码失败，请检查网络连接。"
+    fi
+
+    log_info "正在编译并安装 Dante..."
+    tar -xzf "${temp_build_dir}/dante.tar.gz" -C "$temp_build_dir" --strip-components=1
+    (
+        cd "$temp_build_dir"
+        ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var --disable-client >/dev/null
+        make -j"$(nproc 2>/dev/null || echo 1)" >/dev/null
+        make install >/dev/null
+    ) || die "编译安装 Dante 失败。"
+
+    rm -rf -- "$temp_build_dir"
 }
 
 install_dependencies() {
@@ -687,11 +719,19 @@ install_dependencies() {
         apt)
             export DEBIAN_FRONTEND=noninteractive
             packages=(curl ca-certificates iproute2 passwd)
-            if ((DANTE_WAS_PRESENT == 0)); then
-                packages+=(dante-server)
-            fi
             apt-get update
-            apt-get install -y --no-install-recommends "${packages[@]}"
+            if ((DANTE_WAS_PRESENT == 0)); then
+                if apt-cache show dante-server >/dev/null 2>&1; then
+                    packages+=(dante-server)
+                    apt-get install -y --no-install-recommends "${packages[@]}"
+                else
+                    log_warn "软件源中未找到 dante-server（如 Debian 13 trixie），将自动从源码编译安装 Dante..."
+                    apt-get install -y --no-install-recommends "${packages[@]}" build-essential libpam0g-dev
+                    compile_and_install_dante
+                fi
+            else
+                apt-get install -y --no-install-recommends "${packages[@]}"
+            fi
             ;;
         dnf | yum)
             packages=(curl ca-certificates iproute shadow-utils)
